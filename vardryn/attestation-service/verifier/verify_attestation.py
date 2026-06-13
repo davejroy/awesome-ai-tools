@@ -1,0 +1,390 @@
+#!/usr/bin/env python3
+"""
+Standalone, offline attestation bundle verifier — §5.1.
+
+Given one `vardryn.attestation.bundle/1.0` JSON document (service/bundle.py),
+runs 11 independent checks and prints a PASS/FAIL/SKIP report. Exits 0 only
+if every check is PASS or SKIP; exits 1 if any check FAILs.
+
+Dependencies: `cryptography`, `fido2` (pulls in `cbor2`), and stdlib — see
+requirements.txt. `asn1crypto` is OPTIONAL: without it, check 10 (RFC 3161
+timestamp) reports SKIP instead of verifying `tsa_token`.
+
+Every cryptographic primitive used here (canonicalize, compute_entry_hash,
+verify_cose_signature, verify_platform_sig_entry, the YubiKey 5 AAGUID
+allowlist) is a file-identical copy of the corresponding module under
+service/ — see each vendored module's docstring. This script imports ONLY
+those vendored copies plus stdlib, so it can run with nothing but this
+`verifier/` directory and a bundle file: no database, no network, no
+service/ checkout required.
+
+Usage:
+    python3 verify_attestation.py BUNDLE.json [--prev-bundle PREV_BUNDLE.json]
+
+`--prev-bundle` is the bundle for the ledger entry immediately preceding
+this one (seq - 1) in the same tenant's chain. It is required for check 11
+("chain linkage") to PASS for any entry with seq > 1; without it, check 11
+reports SKIP for those entries (seq == 1 is checked against the published
+genesis hash regardless).
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import hashlib
+import json
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from authenticator_allowlist import is_allowed_aaguid  # noqa: E402
+from canonical.jcs import canonicalize  # noqa: E402
+from entry_hash import ENTRY_HASH_FIELDS, compute_entry_hash  # noqa: E402
+from platform_signature import PlatformSignatureError, verify_platform_sig_entry  # noqa: E402
+from webauthn_primitives import (  # noqa: E402
+    SignatureVerificationError,
+    b64url_decode,
+    b64url_encode,
+    parse_authenticator_data,
+    parse_client_data_json,
+    verify_cose_signature,
+)
+
+try:
+    from tsa_verify import TsaVerificationError, verify_timestamp_token
+
+    _TSA_AVAILABLE = True
+except ImportError:
+    _TSA_AVAILABLE = False
+
+import cbor2  # noqa: E402
+
+BUNDLE_SCHEMA = "vardryn.attestation.bundle/1.0"
+
+# Mirrors service/bundle.py's _ENTRY_FIELDS without importing bundle.py
+# (bundle.py is assembly-only and not part of the vendored crypto set).
+_ENTRY_FIELDS = ENTRY_HASH_FIELDS + ("platform_sigs", "tsa_token", "created_at")
+
+# Must match service/payload.py's GENESIS_STRING — duplicated here (one
+# constant + one hashlib call) rather than vendoring all of payload.py,
+# which pulls in unrelated nonce/timestamp helpers and a relative import of
+# webauthn_primitives that would conflict with this script's flat layout.
+GENESIS_STRING = "vardryn.attestation.genesis/1.0"
+
+
+@dataclass
+class CheckResult:
+    number: int
+    name: str
+    status: str  # "PASS" | "FAIL" | "SKIP"
+    detail: str
+
+
+def _genesis_hash_b64url() -> str:
+    return b64url_encode(hashlib.sha512(GENESIS_STRING.encode("utf-8")).digest())
+
+
+# ── Individual checks ────────────────────────────────────────────────────────
+
+
+def check_01_schema(bundle: dict) -> tuple[str, str]:
+    errors = []
+    if bundle.get("schema") != BUNDLE_SCHEMA:
+        errors.append(f"bundle schema={bundle.get('schema')!r}, expected {BUNDLE_SCHEMA!r}")
+
+    entry = bundle.get("entry", {})
+    missing = [f for f in _ENTRY_FIELDS if f not in entry]
+    if missing:
+        errors.append(f"entry missing fields: {missing}")
+
+    if entry.get("payload_hash_alg") != "SHA-512":
+        errors.append(f"entry.payload_hash_alg={entry.get('payload_hash_alg')!r}, expected 'SHA-512'")
+
+    if errors:
+        return "FAIL", "; ".join(errors)
+    return "PASS", f"schema={BUNDLE_SCHEMA}, payload_hash_alg=SHA-512, all entry fields present"
+
+
+def check_02_payload_canonicalization(bundle: dict) -> tuple[str, str]:
+    payload = bundle["payload"]
+    payload_jcs = bundle["payload_jcs"]
+
+    recomputed = canonicalize(payload)
+    expected = payload_jcs.encode("utf-8")
+
+    if recomputed != expected:
+        return (
+            "FAIL",
+            f"canonicalize(payload) ({len(recomputed)} bytes) != bundle.payload_jcs ({len(expected)} bytes)",
+        )
+    return "PASS", f"canonicalize(payload) is byte-identical to payload_jcs ({len(expected)} bytes)"
+
+
+def check_03_payload_hash(bundle: dict) -> tuple[str, str]:
+    payload_jcs = bundle["payload_jcs"]
+    entry = bundle["entry"]
+
+    computed = b64url_encode(hashlib.sha512(payload_jcs.encode("utf-8")).digest())
+    claimed = entry["payload_hash"]
+
+    if computed != claimed:
+        return "FAIL", f"SHA-512(payload_jcs)={computed!r} != entry.payload_hash={claimed!r}"
+    return "PASS", f"entry.payload_hash = SHA-512(payload_jcs) = {claimed} (= H, the WebAuthn challenge)"
+
+
+def check_04_snapshot_hash(bundle: dict) -> tuple[str, str]:
+    entry = bundle["entry"]
+    payload = bundle["payload"]
+
+    snapshot_bytes = base64.b64decode(bundle["snapshot"])
+    computed = b64url_encode(hashlib.sha512(snapshot_bytes).digest())
+
+    if computed != entry["snapshot_hash"]:
+        return "FAIL", f"SHA-512(snapshot bytes)={computed!r} != entry.snapshot_hash={entry['snapshot_hash']!r}"
+    if computed != payload.get("snapshot_hash"):
+        return (
+            "FAIL",
+            f"SHA-512(snapshot bytes)={computed!r} != payload.snapshot_hash={payload.get('snapshot_hash')!r} "
+            "(the exported snapshot does not match what was committed in the signed payload)",
+        )
+    return "PASS", f"SHA-512(snapshot) = entry.snapshot_hash = payload.snapshot_hash = {computed}"
+
+
+def check_05_client_data(bundle: dict) -> tuple[str, str]:
+    entry = bundle["entry"]
+    rp = bundle["rp"]
+
+    client_data_json = b64url_decode(entry["webauthn_client_data"])
+    client_data = parse_client_data_json(client_data_json)
+
+    errors = []
+    if client_data.get("type") != "webauthn.get":
+        errors.append(f"clientData.type={client_data.get('type')!r}, expected 'webauthn.get'")
+    if client_data.get("challenge") != entry["payload_hash"]:
+        errors.append(
+            f"clientData.challenge={client_data.get('challenge')!r} != entry.payload_hash={entry['payload_hash']!r}"
+        )
+    if client_data.get("origin") != rp["origin"]:
+        errors.append(f"clientData.origin={client_data.get('origin')!r} != rp.origin={rp['origin']!r}")
+
+    if errors:
+        return "FAIL", "; ".join(errors)
+    return "PASS", f"type=webauthn.get, challenge=entry.payload_hash, origin={rp['origin']}"
+
+
+def check_06_authenticator_data(bundle: dict) -> tuple[str, str]:
+    entry = bundle["entry"]
+    rp = bundle["rp"]
+
+    auth_data_bytes = b64url_decode(entry["webauthn_auth_data"])
+    auth_data = parse_authenticator_data(auth_data_bytes)
+
+    expected_rp_id_hash = hashlib.sha256(rp["id"].encode("utf-8")).digest()
+
+    errors = []
+    if auth_data.rp_id_hash != expected_rp_id_hash:
+        errors.append("authData.rpIdHash != SHA-256(rp.id)")
+    if not auth_data.user_present:
+        errors.append("authData UP (user present) flag is not set")
+    if not auth_data.user_verified:
+        errors.append("authData UV (user verified) flag is not set")
+
+    if errors:
+        return "FAIL", "; ".join(errors)
+    return "PASS", f"rpIdHash=SHA-256(rp.id), UP=1, UV=1, signCount={auth_data.counter}"
+
+
+def check_07_signature(bundle: dict) -> tuple[str, str]:
+    entry = bundle["entry"]
+    credential = bundle["credential"]
+
+    client_data_json = b64url_decode(entry["webauthn_client_data"])
+    auth_data_bytes = b64url_decode(entry["webauthn_auth_data"])
+    signature = b64url_decode(entry["webauthn_signature"])
+
+    cose_key = cbor2.loads(b64url_decode(credential["public_key_cose"]))
+    signed_message = auth_data_bytes + hashlib.sha256(client_data_json).digest()
+
+    try:
+        verify_cose_signature(cose_key, signed_message, signature)
+    except SignatureVerificationError as exc:
+        return "FAIL", f"webauthn_signature does not verify against credential's registered key: {exc}"
+
+    return "PASS", f"webauthn_signature verifies against credential {credential['credential_id']!r}'s registered COSE key"
+
+
+def check_08_authenticator_allowlist(bundle: dict) -> tuple[str, str]:
+    credential = bundle["credential"]
+    aaguid = credential.get("aaguid", "")
+
+    if is_allowed_aaguid(aaguid):
+        return (
+            "PASS",
+            f"aaguid={aaguid} is on the YubiKey 5 allowlist — NOTE: allowlist is not yet "
+            "cross-checked against a live FIDO MDS3 BLOB (see service/authenticator_allowlist.py)",
+        )
+    return "FAIL", f"aaguid={aaguid!r} is NOT on the YubiKey 5 allowlist (service/authenticator_allowlist.py)"
+
+
+def check_09_entry_hash_and_countersignature(bundle: dict) -> tuple[str, str]:
+    entry = bundle["entry"]
+
+    canonical_fields = {field: entry[field] for field in ENTRY_HASH_FIELDS}
+    entry_hash = compute_entry_hash(canonical_fields)
+    entry_hash_b64url = b64url_encode(entry_hash)
+
+    platform_sigs = entry.get("platform_sigs") or []
+    if not platform_sigs:
+        return "FAIL", f"entry_hash={entry_hash_b64url} recomputed, but platform_sigs is empty"
+
+    verified_suites = []
+    errors = []
+    for i, sig in enumerate(platform_sigs):
+        try:
+            verify_platform_sig_entry(sig, entry_hash)
+            verified_suites.append(sig.get("suite", "?"))
+        except PlatformSignatureError as exc:
+            errors.append(f"platform_sigs[{i}] ({sig.get('suite', '?')}): {exc}")
+
+    if not verified_suites:
+        return "FAIL", f"entry_hash={entry_hash_b64url}; no platform_sigs entry verified: {'; '.join(errors)}"
+
+    detail = f"entry_hash={entry_hash_b64url} (recomputed); verified suites: {', '.join(verified_suites)}"
+    if errors:
+        detail += f"; additionally, unverified entries present: {'; '.join(errors)}"
+    return "PASS", detail
+
+
+def check_10_tsa_token(bundle: dict, entry_hash: bytes) -> tuple[str, str]:
+    entry = bundle["entry"]
+    tsa_token = entry.get("tsa_token")
+
+    if tsa_token is None:
+        return "SKIP", "entry.tsa_token is null (RFC 3161 timestamp is optional, §3)"
+
+    if not _TSA_AVAILABLE:
+        return "SKIP", "asn1crypto is not installed; cannot verify entry.tsa_token (optional dependency)"
+
+    try:
+        token_der = base64.b64decode(tsa_token)
+        result = verify_timestamp_token(token_der, entry_hash)
+    except TsaVerificationError as exc:
+        return "FAIL", f"tsa_token does not verify: {exc}"
+
+    tsa_name = result.tsa_name or "(unnamed)"
+    return "PASS", f"tsa_token verifies: gen_time={result.gen_time.isoformat()}, tsa={tsa_name}"
+
+
+def check_11_chain_linkage(bundle: dict, prev_bundle: dict | None) -> tuple[str, str]:
+    entry = bundle["entry"]
+    seq = entry["seq"]
+    prev_entry_hash = entry["prev_entry_hash"]
+
+    if seq == 1:
+        genesis = _genesis_hash_b64url()
+        if prev_entry_hash != genesis:
+            return "FAIL", f"seq=1 but prev_entry_hash={prev_entry_hash!r} != genesis hash {genesis!r}"
+        return "PASS", f"seq=1, prev_entry_hash = genesis ({genesis})"
+
+    if prev_bundle is None:
+        return "SKIP", f"seq={seq} > 1 and no --prev-bundle provided; chain linkage not checked"
+
+    prev_entry = prev_bundle["entry"]
+    prev_canonical_fields = {field: prev_entry[field] for field in ENTRY_HASH_FIELDS}
+    prev_entry_hash_recomputed = b64url_encode(compute_entry_hash(prev_canonical_fields))
+
+    errors = []
+    if prev_entry["seq"] + 1 != seq:
+        errors.append(f"--prev-bundle entry.seq={prev_entry['seq']}, expected {seq - 1}")
+    if prev_entry_hash != prev_entry_hash_recomputed:
+        errors.append(
+            f"entry.prev_entry_hash={prev_entry_hash!r} != recomputed hash of --prev-bundle "
+            f"({prev_entry_hash_recomputed!r})"
+        )
+
+    if errors:
+        return "FAIL", "; ".join(errors)
+    return "PASS", f"seq={seq} immediately follows --prev-bundle (seq={prev_entry['seq']}) in the hash chain"
+
+
+# ── Orchestration ────────────────────────────────────────────────────────────
+
+
+_CHECKS = [
+    ("Bundle schema and entry shape", check_01_schema),
+    ("Payload canonicalization (JCS round-trip)", check_02_payload_canonicalization),
+    ("Payload hash == WebAuthn challenge H", check_03_payload_hash),
+    ("Snapshot hash matches entry and payload", check_04_snapshot_hash),
+    ("clientDataJSON (type, challenge, origin)", check_05_client_data),
+    ("authenticatorData (rpIdHash, UP, UV)", check_06_authenticator_data),
+    ("WebAuthn assertion signature", check_07_signature),
+    ("Authenticator allowlist (AAGUID)", check_08_authenticator_allowlist),
+    ("entry_hash + platform countersignature", check_09_entry_hash_and_countersignature),
+    ("RFC 3161 timestamp (tsa_token)", None),  # special-cased: needs entry_hash
+    ("Chain linkage (prev_entry_hash)", None),  # special-cased: needs prev_bundle
+]
+
+
+def run_checks(bundle: dict, prev_bundle: dict | None) -> list[CheckResult]:
+    results: list[CheckResult] = []
+
+    entry_hash: bytes | None = None
+    for number, (name, fn) in enumerate(_CHECKS, start=1):
+        try:
+            if number == 9:
+                status, detail = fn(bundle)
+                # Recompute entry_hash again for check 10 — cheap, and keeps
+                # check 10 independent of whether check 9 itself passed.
+                canonical_fields = {field: bundle["entry"][field] for field in ENTRY_HASH_FIELDS}
+                entry_hash = compute_entry_hash(canonical_fields)
+            elif number == 10:
+                if entry_hash is None:
+                    canonical_fields = {field: bundle["entry"][field] for field in ENTRY_HASH_FIELDS}
+                    entry_hash = compute_entry_hash(canonical_fields)
+                status, detail = check_10_tsa_token(bundle, entry_hash)
+            elif number == 11:
+                status, detail = check_11_chain_linkage(bundle, prev_bundle)
+            else:
+                status, detail = fn(bundle)
+        except Exception as exc:  # noqa: BLE001 — a malformed/tampered bundle must produce a FAIL, not a crash
+            status, detail = "FAIL", f"check raised {type(exc).__name__}: {exc}"
+
+        results.append(CheckResult(number=number, name=name, status=status, detail=detail))
+
+    return results
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("bundle", type=Path, help="path to a vardryn.attestation.bundle/1.0 JSON file")
+    parser.add_argument(
+        "--prev-bundle",
+        type=Path,
+        default=None,
+        help="path to the bundle for ledger entry seq-1 (required for check 11 to PASS when seq > 1)",
+    )
+    args = parser.parse_args()
+
+    bundle = json.loads(args.bundle.read_text(encoding="utf-8"))
+    prev_bundle = json.loads(args.prev_bundle.read_text(encoding="utf-8")) if args.prev_bundle else None
+
+    results = run_checks(bundle, prev_bundle)
+
+    for r in results:
+        print(f"[{r.status}] {r.number:2d}. {r.name} — {r.detail}")
+
+    passed = sum(1 for r in results if r.status == "PASS")
+    skipped = sum(1 for r in results if r.status == "SKIP")
+    failed = sum(1 for r in results if r.status == "FAIL")
+
+    print()
+    print(f"{passed} passed, {skipped} skipped, {failed} failed (of {len(results)})")
+
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
