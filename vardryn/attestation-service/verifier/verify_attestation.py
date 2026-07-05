@@ -61,6 +61,7 @@ except ImportError:
     _TSA_AVAILABLE = False
 
 import cbor2  # noqa: E402
+from cryptography.hazmat.primitives import serialization  # noqa: E402
 
 BUNDLE_SCHEMA = "vardryn.attestation.bundle/1.0"
 
@@ -229,7 +230,32 @@ def check_08_authenticator_allowlist(bundle: dict) -> tuple[str, str]:
     return "FAIL", f"aaguid={aaguid!r} is NOT on the YubiKey 5 allowlist (service/authenticator_allowlist.py)"
 
 
-def check_09_entry_hash_and_countersignature(bundle: dict) -> tuple[str, str]:
+def _public_keys_match(pem_a: str, pem_b: str) -> bool:
+    """True iff two PEM public keys encode the same key (compared by DER
+    SubjectPublicKeyInfo, so whitespace/line-ending differences don't matter)."""
+    try:
+        der_a = serialization.load_pem_public_key(pem_a.encode("ascii")).public_bytes(
+            encoding=serialization.Encoding.DER, format=serialization.PublicFormat.SubjectPublicKeyInfo
+        )
+        der_b = serialization.load_pem_public_key(pem_b.encode("ascii")).public_bytes(
+            encoding=serialization.Encoding.DER, format=serialization.PublicFormat.SubjectPublicKeyInfo
+        )
+    except Exception:
+        return False
+    return der_a == der_b
+
+
+def check_09_entry_hash_and_countersignature(
+    bundle: dict, trusted_platform_keys: dict[str, str] | None
+) -> tuple[str, str]:
+    """V09 / V09b (20d, patched v0.2 per SCR-001).
+
+    The platform countersignature MUST be verified against a public key
+    pinned OUT OF BAND (a trust store keyed by `key_ref` == `kms_key_version`),
+    NOT the bundle-embedded PEM. The embedded PEM is advisory only: if it
+    disagrees with the pinned key, that is a FAIL. An unknown `key_ref` is a
+    FAIL (V09b — no trust-on-first-use). Verifying against the bundle-supplied
+    key would be self-referential and defeat the check (the SCR-001 defect)."""
     entry = bundle["entry"]
 
     canonical_fields = {field: entry[field] for field in ENTRY_HASH_FIELDS}
@@ -238,24 +264,111 @@ def check_09_entry_hash_and_countersignature(bundle: dict) -> tuple[str, str]:
 
     platform_sigs = entry.get("platform_sigs") or []
     if not platform_sigs:
-        return "FAIL", f"entry_hash={entry_hash_b64url} recomputed, but platform_sigs is empty"
+        return "FAIL", (
+            f"entry_hash={entry_hash_b64url} recomputed, but platform_sigs is empty "
+            "(V09 required-signature policy)"
+        )
+
+    # V09b: with no out-of-band trust anchor there is nothing to pin against.
+    # Trusting the embedded PEM would be self-referential (SCR-001), so we do
+    # NOT return PASS — we SKIP loudly. A real audit MUST supply --platform-key.
+    if not trusted_platform_keys:
+        return "SKIP", (
+            f"entry_hash={entry_hash_b64url} recomputed, but no platform key was pinned "
+            "(--platform-key <key_ref>=<pem>). Per V09b the bundle-embedded PEM is advisory "
+            "ONLY and must not be trusted on its own, so platform provenance is UNVERIFIED. "
+            "Re-run with the platform's out-of-band public key to complete this check."
+        )
 
     verified_suites = []
     errors = []
     for i, sig in enumerate(platform_sigs):
+        key_ref = sig.get("kms_key_version")
+        trusted_pem = trusted_platform_keys.get(key_ref)
+        if trusted_pem is None:
+            errors.append(
+                f"platform_sigs[{i}]: key_ref={key_ref!r} is not in the pinned trust store "
+                "(V09b: unknown key_ref — no trust-on-first-use)"
+            )
+            continue
+        embedded_pem = sig.get("public_key_pem")
+        if embedded_pem is not None and not _public_keys_match(embedded_pem, trusted_pem):
+            errors.append(
+                f"platform_sigs[{i}]: bundle-embedded public_key_pem does not match the pinned key "
+                f"for key_ref={key_ref!r} (V09: advisory PEM / pinned-key mismatch)"
+            )
+            continue
+        # Verify against the PINNED key, not the embedded one.
+        pinned_sig = {**sig, "public_key_pem": trusted_pem}
         try:
-            verify_platform_sig_entry(sig, entry_hash)
+            verify_platform_sig_entry(pinned_sig, entry_hash)
             verified_suites.append(sig.get("suite", "?"))
         except PlatformSignatureError as exc:
-            errors.append(f"platform_sigs[{i}] ({sig.get('suite', '?')}): {exc}")
+            errors.append(
+                f"platform_sigs[{i}] ({sig.get('suite', '?')}): {exc} "
+                f"(verified against pinned key_ref={key_ref!r})"
+            )
 
     if not verified_suites:
-        return "FAIL", f"entry_hash={entry_hash_b64url}; no platform_sigs entry verified: {'; '.join(errors)}"
+        return "FAIL", (
+            f"entry_hash={entry_hash_b64url}; no platform_sigs entry verified against a pinned key: "
+            f"{'; '.join(errors)}"
+        )
 
-    detail = f"entry_hash={entry_hash_b64url} (recomputed); verified suites: {', '.join(verified_suites)}"
+    detail = (
+        f"entry_hash={entry_hash_b64url} (recomputed); verified against pinned key(s), "
+        f"suites: {', '.join(verified_suites)}"
+    )
     if errors:
-        detail += f"; additionally, unverified entries present: {'; '.join(errors)}"
+        detail += f"; additionally, unverified/unpinned entries present: {'; '.join(errors)}"
     return "PASS", detail
+
+
+def check_12_entry_payload_binding(bundle: dict) -> tuple[str, str]:
+    """V12b (20d, added v0.2 per SCR-001).
+
+    Binds the ledger entry's identity fields to the HARDWARE-SIGNED payload,
+    so the WebAuthn signature (which covers the payload, checks 3/5/7)
+    transitively authorizes the entry-row identity. Without this, an attacker
+    who can re-mint the platform countersignature could alter the entry-row
+    identity fields undetected.
+
+    Field-name mapping (this implementation predates the 20d naming): the spec
+    says `signer_identity_id` / `payload.actor.identity_id`; here they are
+    `signer_user_id` / `payload.actor.user_id`."""
+    entry = bundle["entry"]
+    payload = bundle["payload"]
+    actor = payload.get("actor") or {}
+
+    errors = []
+    if entry.get("tenant_id") != payload.get("tenant_id"):
+        errors.append(
+            f"entry.tenant_id={entry.get('tenant_id')!r} != payload.tenant_id={payload.get('tenant_id')!r}"
+        )
+    if entry.get("signer_user_id") != actor.get("user_id"):
+        errors.append(
+            f"entry.signer_user_id={entry.get('signer_user_id')!r} != payload.actor.user_id={actor.get('user_id')!r}"
+        )
+    # Strengthening (still within I3/I4): also bind the signing credential.
+    if entry.get("signer_credential_id") != actor.get("credential_id"):
+        errors.append(
+            f"entry.signer_credential_id={entry.get('signer_credential_id')!r} != "
+            f"payload.actor.credential_id={actor.get('credential_id')!r}"
+        )
+    # entry.payload_hash MUST equal SHA-512(canonical payload) — ties H (the
+    # WebAuthn challenge) into the same binding assertion.
+    computed_h = b64url_encode(hashlib.sha512(bundle["payload_jcs"].encode("utf-8")).digest())
+    if entry.get("payload_hash") != computed_h:
+        errors.append(
+            f"entry.payload_hash={entry.get('payload_hash')!r} != SHA-512(canonical payload)={computed_h!r}"
+        )
+
+    if errors:
+        return "FAIL", "; ".join(errors) + " (V12b entry↔payload identity binding)"
+    return "PASS", (
+        "entry.{tenant_id, signer_user_id, signer_credential_id, payload_hash} are all bound to the "
+        "hardware-signed payload (V12b)"
+    )
 
 
 def check_10_tsa_token(bundle: dict, entry_hash: bytes) -> tuple[str, str]:
@@ -322,20 +435,25 @@ _CHECKS = [
     ("authenticatorData (rpIdHash, UP, UV)", check_06_authenticator_data),
     ("WebAuthn assertion signature", check_07_signature),
     ("Authenticator allowlist (AAGUID)", check_08_authenticator_allowlist),
-    ("entry_hash + platform countersignature", check_09_entry_hash_and_countersignature),
+    ("entry_hash + platform countersignature (V09/V09b)", None),  # special-cased: needs pinned keys
     ("RFC 3161 timestamp (tsa_token)", None),  # special-cased: needs entry_hash
     ("Chain linkage (prev_entry_hash)", None),  # special-cased: needs prev_bundle
+    ("Entry↔payload identity binding (V12b)", check_12_entry_payload_binding),
 ]
 
 
-def run_checks(bundle: dict, prev_bundle: dict | None) -> list[CheckResult]:
+def run_checks(
+    bundle: dict,
+    prev_bundle: dict | None,
+    trusted_platform_keys: dict[str, str] | None = None,
+) -> list[CheckResult]:
     results: list[CheckResult] = []
 
     entry_hash: bytes | None = None
     for number, (name, fn) in enumerate(_CHECKS, start=1):
         try:
             if number == 9:
-                status, detail = fn(bundle)
+                status, detail = check_09_entry_hash_and_countersignature(bundle, trusted_platform_keys)
                 # Recompute entry_hash again for check 10 — cheap, and keeps
                 # check 10 independent of whether check 9 itself passed.
                 canonical_fields = {field: bundle["entry"][field] for field in ENTRY_HASH_FIELDS}
@@ -357,6 +475,18 @@ def run_checks(bundle: dict, prev_bundle: dict | None) -> list[CheckResult]:
     return results
 
 
+def _parse_platform_key_args(specs: list[str] | None) -> dict[str, str]:
+    """Parses repeated --platform-key KEY_REF=PATH args into {key_ref: pem_text}.
+    KEY_REF is the full KMS key-version resource name (== platform_sigs[].kms_key_version)."""
+    trusted: dict[str, str] = {}
+    for spec in specs or []:
+        if "=" not in spec:
+            raise SystemExit(f"--platform-key must be KEY_REF=PATH, got {spec!r}")
+        key_ref, path = spec.split("=", 1)
+        trusted[key_ref] = Path(path).read_text(encoding="ascii")
+    return trusted
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("bundle", type=Path, help="path to a vardryn.attestation.bundle/1.0 JSON file")
@@ -366,12 +496,25 @@ def main() -> int:
         default=None,
         help="path to the bundle for ledger entry seq-1 (required for check 11 to PASS when seq > 1)",
     )
+    parser.add_argument(
+        "--platform-key",
+        action="append",
+        metavar="KEY_REF=PATH",
+        default=None,
+        help=(
+            "pin a trusted platform countersignature public key OUT OF BAND (V09/V09b). "
+            "KEY_REF is the full KMS key-version resource name (== platform_sigs[].kms_key_version); "
+            "PATH is a PEM file. Repeatable. Without at least one, check 9 SKIPs (platform provenance "
+            "cannot be verified from the bundle alone — SCR-001)."
+        ),
+    )
     args = parser.parse_args()
 
     bundle = json.loads(args.bundle.read_text(encoding="utf-8"))
     prev_bundle = json.loads(args.prev_bundle.read_text(encoding="utf-8")) if args.prev_bundle else None
+    trusted_platform_keys = _parse_platform_key_args(args.platform_key)
 
-    results = run_checks(bundle, prev_bundle)
+    results = run_checks(bundle, prev_bundle, trusted_platform_keys)
 
     for r in results:
         print(f"[{r.status}] {r.number:2d}. {r.name} — {r.detail}")

@@ -93,10 +93,19 @@ checklist):
 ## 3. Running the verifier
 
 ```text
-python3 verify_attestation.py BUNDLE.json [--prev-bundle PREV_BUNDLE.json]
+python3 verify_attestation.py BUNDLE.json \
+    --platform-key <key_ref>=platform_key.pem \
+    [--prev-bundle PREV_BUNDLE.json]
 ```
 
 - `BUNDLE.json` — the attestation bundle you are validating.
+- `--platform-key <key_ref>=platform_key.pem` — *(required for check 9 to
+  verify platform provenance)* — pins the platform's countersignature public
+  key from a source **independent of the bundle**. `<key_ref>` is the value in
+  `platform_sigs[i].kms_key_version`; `platform_key.pem` is the platform's KMS
+  public key, obtained out of band. Repeatable if more than one key is in use.
+  Omit it and check 9 will `SKIP` (it never trusts the key carried inside the
+  bundle). See check 9 below.
 - `--prev-bundle PREV_BUNDLE.json` — *(optional, but required for a full
   check 11 on any entry with `seq > 1`)* — the bundle for the
   **immediately preceding** ledger entry (`seq - 1`) in the **same tenant's**
@@ -109,10 +118,12 @@ The script prints one line per check, in order:
 [PASS]  1. Bundle schema and entry shape — schema=vardryn.attestation.bundle/1.0, ...
 [PASS]  2. Payload canonicalization (JCS round-trip) — canonicalize(payload) is byte-identical to payload_jcs (...)
 ...
+[PASS]  9. entry_hash + platform countersignature (V09/V09b) — verified against pinned key(s), ...
 [SKIP] 10. RFC 3161 timestamp (tsa_token) — entry.tsa_token is null (RFC 3161 timestamp is optional, §3)
 [PASS] 11. Chain linkage (prev_entry_hash) — seq=1, prev_entry_hash = genesis (...)
+[PASS] 12. Entry↔payload identity binding (V12b) — entry.{tenant_id, signer_user_id, ...} bound to payload
 
-11 passed, 0 skipped, 0 failed (of 11)
+11 passed, 1 skipped, 0 failed (of 12)
 ```
 
 **Exit code 0** means every check reported `PASS` or `SKIP` — no `FAIL`s.
@@ -126,7 +137,7 @@ inconsistent — there is no concept of a "minor" failure.
 
 ---
 
-## 4. The 11 checks, explained
+## 4. The 12 checks, explained
 
 ### Check 1 — Bundle schema and entry shape
 
@@ -251,24 +262,61 @@ SHA-512 to produce `entry_hash`. This check:
 
 1. Recomputes `entry_hash` from the bundle's own `entry` fields.
 2. Verifies at least one signature in `entry.platform_sigs` against that
-   recomputed hash, using the embedded public key
-   (`platform_sigs[i].public_key_pem`) and declared algorithm
-   (`platform_sigs[i].suite` — currently `RSASSA-PSS-4096-SHA512`, a Cloud
-   KMS asymmetric-signing key).
+   recomputed hash, using a **platform public key you pin out of band** and
+   the declared algorithm (`platform_sigs[i].suite` — currently
+   `RSASSA-PSS-4096-SHA512`, a Cloud KMS asymmetric-signing key).
+
+> **You MUST supply the platform's public key** with
+> `--platform-key <key_ref>=<path-to-pem>`, where `key_ref` is the value in
+> `platform_sigs[i].kms_key_version`. The verifier checks the signature
+> against *that pinned key*, not against the key embedded in the bundle. The
+> embedded `public_key_pem` is **advisory only**: if it disagrees with your
+> pinned key the check FAILs, and an unrecognized `key_ref` FAILs (no
+> trust-on-first-use). **If you do not pass `--platform-key`, check 9 reports
+> `SKIP`, not `PASS`** — because trusting a key carried inside the bundle
+> would let anyone who rewrites a ledger row also rewrite the key that
+> "vouches" for it. Obtain the platform's KMS public key through a channel
+> independent of the bundle (e.g., the published chain-head notice or a
+> key fingerprint handed over at engagement).
 
 *Why it matters:* this is the platform's own tamper-seal over the entire
 entry — independent of the approver's hardware key. **Any** change to
-**any** field listed in `ENTRY_HASH_FIELDS` (the payload hash, the snapshot
-hash, the WebAuthn assertion bytes, the chain-linkage hash, the sequence
-number, the signer identity, etc.) changes `entry_hash`, which breaks this
-signature. This is the check that catches "someone edited one field of an
-otherwise-valid-looking ledger row after the fact."
+**any** field listed in `ENTRY_HASH_FIELDS` changes `entry_hash`, which
+breaks a signature made by the pinned platform key: an attacker cannot
+re-mint it without the platform's KMS private key. Combined with check 12,
+this is what catches "someone edited one field of an otherwise-valid-looking
+ledger row after the fact." (Historical note: before SCR-001 this check
+verified against the *bundle-embedded* key, which an attacker controls — so
+a re-signed forgery passed. That defect is fixed by the out-of-band pinning
+above and by check 12.)
 
 `platform_sigs` is an array by design, so a second signature under a
 different algorithm (e.g., a future post-quantum scheme) can be added later
 without changing this format; this check passes if **at least one** entry
-verifies, and additionally reports any entries that do not (which itself may
-be worth investigating, depending on your policy).
+verifies against a pinned key, and additionally reports any entries that do
+not (which itself may be worth investigating, depending on your policy).
+
+### Check 12 — Entry↔payload identity binding (V12b)
+
+*(This check is numbered 12 and runs last, after check 11; it is described
+here because it closes the same SCR-001 gap as check 9.)*
+
+The ledger row stores the tenant, signing user, and signing credential as
+their own columns; the *same* facts are also inside the payload `P` that the
+approver's hardware key signed (checks 3/5/7). This check requires them to
+agree: `entry.tenant_id == payload.tenant_id`,
+`entry.signer_user_id == payload.actor.user_id`,
+`entry.signer_credential_id == payload.actor.credential_id`, and
+`entry.payload_hash == SHA-512(canonical payload)`.
+
+*Why it matters:* the hardware signature covers the payload, so binding the
+entry-row identity fields back to the payload makes that signature
+transitively authorize *who* the entry is attributed to. Without this check,
+an attacker who could re-mint the platform countersignature (check 9) could
+change only the ledger row's tenant or signer — re-attributing an approval to
+a different person or organization — while leaving the payload and hardware
+signature untouched. Check 12 (with check 9's out-of-band pinning) closes
+that gap. Any mismatch is a `FAIL`.
 
 ### Check 10 — RFC 3161 timestamp (tsa_token)
 
@@ -357,6 +405,7 @@ entry 8 follows entry 7" rather than guessing.
 | 6 | authenticatorData | Wrong relying party, or user-present/user-verified flags not set. | *(never)* |
 | 7 | WebAuthn assertion signature | The hardware-key signature does not verify against the registered key over this data. | *(never)* |
 | 8 | Authenticator allowlist | The credential's device model is not on the approved-hardware allowlist. | *(never)* |
-| 9 | entry_hash + platform countersignature | Some field of the ledger entry was altered after the platform countersigned it. | *(never)* |
+| 9 | entry_hash + platform countersignature (V09/V09b) | The countersignature does not verify against your **pinned** platform key, the bundle-embedded key disagrees with it, or the `key_ref` is not one you trust. | You did not pass `--platform-key`, so platform provenance could not be verified (the embedded key is never trusted on its own). |
 | 10 | RFC 3161 timestamp | A present timestamp token does not verify or does not match this entry. | No timestamp was attached (by design, best-effort), or `asn1crypto` is not installed. |
 | 11 | Chain linkage | This entry's declared predecessor hash does not match the supplied `--prev-bundle`'s recomputed hash, or (for `seq == 1`) does not match the published genesis hash. | No `--prev-bundle` was supplied for an entry with `seq > 1`. |
+| 12 | Entry↔payload identity binding (V12b) | The ledger row's tenant / signer / credential / payload-hash do not match the hardware-signed payload — the entry may have been re-attributed. | *(never)* |

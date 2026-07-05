@@ -14,11 +14,18 @@ verifier/verify_attestation.py, run as a SUBPROCESS — i.e. exactly the
 standalone CLI an auditor would invoke, with its stdout parsed for the
 per-check `[STATUS] NN. ...` lines.
 
+Every verifier invocation pins the legitimate platform key out-of-band via
+`--platform-key <key_ref>=<pem>` (V09/V09b) — exactly as a real auditor would
+supply the platform's published KMS public key. Without it, check 9 SKIPs
+rather than trusting the bundle-embedded PEM (the root of SCR-001), and the
+matrix asserts that SKIP behaviour explicitly.
+
 Then 14 INDEPENDENT single-field mutations are applied — one per case — to
 deep copies of the baseline bundles, and the mutated bundle is re-verified.
 Each case asserts that its documented check number(s) are in the FAIL set
 (other checks may incidentally also FAIL; that is not asserted against).
-Together the 14 cases touch every one of the 11 checks at least once:
+Together the 14 field mutations plus T25/T26 touch every one of the 12 checks
+at least once:
 
   1.  bundle_schema             -> check  1 (bundle schema)
   2.  payload_action_body        -> check  2 (JCS round-trip)
@@ -34,6 +41,8 @@ Together the 14 cases touch every one of the 11 checks at least once:
   12. platform_sig                -> check  9 (countersignature)
   13. tsa_token                   -> check 10 (RFC 3161 timestamp)
   14. chain_linkage_prev_entry_hash -> checks 9, 11 (chain linkage, bundle2 + --prev-bundle bundle1)
+  T25 resign_attack             -> check  9 (V09 pinned-key mismatch; SCR-001)
+  T26 entry_payload_mismatch    -> check 12 (V12b entry↔payload binding; V09 PASSES; SCR-001)
 
 Finally, `test_vendored_modules_byte_identical` checks the byte-identical
 vendoring promise made in the docstrings of canonical/jcs.py,
@@ -82,6 +91,10 @@ from service.webauthn_ceremony import begin_ceremony, complete_ceremony  # noqa:
 from service.webauthn_primitives import b64url_decode, b64url_encode  # noqa: E402
 
 VERIFY_SCRIPT = ROOT / "verifier" / "verify_attestation.py"
+
+# The fake-KMS key_version_name used by _generate_bundles' countersigner —
+# also the `key_ref` the verifier pins the trusted platform key under (V09b).
+PLATFORM_KEY_REF = "projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1"
 
 RP_ID = "vardryn.example"
 ORIGIN = "https://vardryn.example"
@@ -337,7 +350,7 @@ def _generate_bundles(kms_key: rsa.RSAPrivateKey) -> tuple[dict, dict]:
 
     countersigner = KmsCountersigner(
         client=FakeKmsClient(kms_key),
-        key_version_name="projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1",
+        key_version_name=PLATFORM_KEY_REF,
     )
     archiver = FakeSnapshotArchiver()
 
@@ -359,12 +372,19 @@ def _generate_bundles(kms_key: rsa.RSAPrivateKey) -> tuple[dict, dict]:
 _CHECK_LINE_RE = re.compile(r"^\[(PASS|FAIL|SKIP)\]\s*(\d+)\.")
 
 
-def _run_verifier(bundle_path: Path, prev_bundle_path: Path | None = None) -> tuple[int, dict[int, str], str]:
+def _run_verifier(
+    bundle_path: Path,
+    prev_bundle_path: Path | None = None,
+    platform_key_arg: str | None = None,
+) -> tuple[int, dict[int, str], str]:
     """Runs verifier/verify_attestation.py as a subprocess. Returns
-    (returncode, {check_number: status}, stdout)."""
+    (returncode, {check_number: status}, stdout). `platform_key_arg` is a
+    'KEY_REF=PATH' string pinning the trusted platform key (V09/V09b)."""
     cmd = [sys.executable, str(VERIFY_SCRIPT), str(bundle_path)]
     if prev_bundle_path is not None:
         cmd += ["--prev-bundle", str(prev_bundle_path)]
+    if platform_key_arg is not None:
+        cmd += ["--platform-key", platform_key_arg]
     proc = subprocess.run(cmd, capture_output=True, text=True)
 
     statuses: dict[int, str] = {}
@@ -498,6 +518,55 @@ def tamper_chain_linkage_prev_entry_hash(bundle2: dict) -> dict:
     return b
 
 
+# ── SCR-001 re-sign attacks (T25, T26) ──────────────────────────────────────
+
+
+def _pem_of(key: rsa.RSAPrivateKey) -> str:
+    return key.public_key().public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    ).decode("ascii")
+
+
+def _resign_entry(bundle: dict, signing_key: rsa.RSAPrivateKey) -> dict:
+    """Recompute entry_hash from the (already-mutated) entry and overwrite
+    platform_sigs[0].{sig, public_key_pem} with a fresh RSA-PSS-4096-SHA512
+    countersignature under `signing_key` — i.e. the attacker (or platform)
+    re-mints the countersignature over the tampered entry."""
+    entry_hash = _recompute_entry_hash_from_bundle(bundle["entry"])
+    sig = signing_key.sign(
+        entry_hash,
+        padding.PSS(mgf=padding.MGF1(hashes.SHA512()), salt_length=hashes.SHA512().digest_size),
+        hashes.SHA512(),
+    )
+    bundle["entry"]["platform_sigs"][0]["sig"] = base64.b64encode(sig).decode("ascii")
+    bundle["entry"]["platform_sigs"][0]["public_key_pem"] = _pem_of(signing_key)
+    return bundle
+
+
+def tamper_t25_resign_attack(bundle1: dict) -> dict:
+    """T25 (SCR-001): forge an entry-row field NOT covered by the payload
+    (entry_id), then re-generate the countersignature with an ATTACKER-owned
+    key and swap in the attacker's embedded PEM. Must FAIL V09 — the attacker's
+    key is not the pinned platform key (embedded-PEM / pinned-key mismatch)."""
+    b = copy.deepcopy(bundle1)
+    b["entry"]["tsa_token"] = None  # isolate V09 (a stale TSA token would also FAIL check 10)
+    b["entry"]["entry_id"] = str(uuid.uuid4())
+    attacker_key = rsa.generate_private_key(public_exponent=65537, key_size=4096)
+    return _resign_entry(b, attacker_key)
+
+
+def tamper_t26_entry_payload_mismatch(bundle1: dict, kms_key: rsa.RSAPrivateKey) -> dict:
+    """T26 (SCR-001): leave the payload + WebAuthn assertion intact; change only
+    the ledger-row copy of tenant_id, then re-mint the countersignature with the
+    LEGITIMATE platform key. V09 PASSES (validly countersigned by the pinned
+    key) but V12b MUST FAIL — entry.tenant_id no longer equals payload.tenant_id."""
+    b = copy.deepcopy(bundle1)
+    b["entry"]["tsa_token"] = None
+    b["entry"]["tenant_id"] = str(uuid.uuid4())
+    return _resign_entry(b, kms_key)
+
+
 # (case_name, mutate_fn, target ("bundle1" or "bundle2"), expected FAIL check numbers)
 _TAMPER_CASES: tuple[tuple[str, callable, str, frozenset[int]], ...] = (
     ("bundle_schema", tamper_bundle_schema, "bundle1", frozenset({1})),
@@ -540,11 +609,26 @@ def test_tamper_matrix(kms_key: rsa.RSAPrivateKey) -> None:
         bundle1_path.write_bytes(bundle_to_json_bytes(bundle1))
         bundle2_path.write_bytes(bundle_to_json_bytes(bundle2))
 
-        rc, statuses, out = _run_verifier(bundle1_path)
+        # Pin the legitimate platform key out-of-band (V09/V09b) — every
+        # verifier invocation runs as a real auditor would, with the platform's
+        # published KMS public key supplied via --platform-key.
+        key_pem_path = tmp / "platform_key.pem"
+        key_pem_path.write_text(_pem_of(kms_key), encoding="ascii")
+        pk = f"{PLATFORM_KEY_REF}={key_pem_path}"
+
+        rc, statuses, out = _run_verifier(bundle1_path, platform_key_arg=pk)
         assert rc == 0 and "FAIL" not in statuses.values(), f"bundle1 baseline not clean:\n{out}"
-        rc, statuses, out = _run_verifier(bundle2_path, bundle1_path)
+        assert statuses.get(9) == "PASS", f"baseline check 9 should PASS with a pinned key, got {statuses.get(9)}\n{out}"
+        assert statuses.get(12) == "PASS", f"baseline check 12 (V12b) should PASS:\n{out}"
+        rc, statuses, out = _run_verifier(bundle2_path, bundle1_path, platform_key_arg=pk)
         assert rc == 0 and "FAIL" not in statuses.values(), f"bundle2 baseline not clean:\n{out}"
-        print("PASS: baseline bundles (seq=1 with tsa_token, seq=2 chained) verify cleanly (0 FAIL)")
+        print("PASS: baseline bundles verify cleanly with pinned platform key (0 FAIL, checks 9 & 12 PASS)")
+
+        # V09b: with NO pinned key, check 9 must SKIP (never trust the embedded
+        # PEM) rather than PASS — the root of SCR-001.
+        rc, statuses, out = _run_verifier(bundle1_path)
+        assert statuses.get(9) == "SKIP", f"check 9 must SKIP without --platform-key, got {statuses.get(9)}\n{out}"
+        print("PASS: without a pinned key, check 9 SKIPs (embedded PEM never trusted — V09b)")
 
         for name, mutate, target, expected_fail in _TAMPER_CASES:
             base = bundle1 if target == "bundle1" else bundle2
@@ -553,7 +637,7 @@ def test_tamper_matrix(kms_key: rsa.RSAPrivateKey) -> None:
             tampered_path.write_bytes(bundle_to_json_bytes(tampered))
 
             prev = bundle1_path if target == "bundle2" else None
-            rc, statuses, out = _run_verifier(tampered_path, prev)
+            rc, statuses, out = _run_verifier(tampered_path, prev, platform_key_arg=pk)
 
             assert rc == 1, f"{name}: expected nonzero exit (>=1 FAIL), got rc={rc}\n{out}"
             failed = {n for n, s in statuses.items() if s == "FAIL"}
@@ -563,7 +647,28 @@ def test_tamper_matrix(kms_key: rsa.RSAPrivateKey) -> None:
             )
             print(f"PASS: {name} -> check(s) {sorted(expected_fail)} FAIL (full FAIL set: {sorted(failed)})")
 
-    print(f"\nOK: all {len(_TAMPER_CASES)} tamper cases produced their expected FAIL(s)")
+        # ── T25 — re-sign attack (SCR-001): forge entry_id + attacker key ──
+        t25_path = tmp / "tampered_T25_resign_attack.json"
+        t25_path.write_bytes(bundle_to_json_bytes(tamper_t25_resign_attack(bundle1)))
+        rc, statuses, out = _run_verifier(t25_path, platform_key_arg=pk)
+        failed = {n for n, s in statuses.items() if s == "FAIL"}
+        assert rc == 1 and 9 in failed, f"T25 must FAIL V09 (pinned-key mismatch); got rc={rc}, FAIL={sorted(failed)}\n{out}"
+        print(f"PASS: T25 re-sign attack -> check 9 (V09) FAIL (full FAIL set: {sorted(failed)})")
+
+        # ── T26 — entry↔payload mismatch (SCR-001): legit re-sign, bad identity ──
+        t26_path = tmp / "tampered_T26_entry_payload_mismatch.json"
+        t26_path.write_bytes(bundle_to_json_bytes(tamper_t26_entry_payload_mismatch(bundle1, kms_key)))
+        rc, statuses, out = _run_verifier(t26_path, platform_key_arg=pk)
+        failed = {n for n, s in statuses.items() if s == "FAIL"}
+        assert rc == 1 and 12 in failed, f"T26 must FAIL V12b; got rc={rc}, FAIL={sorted(failed)}\n{out}"
+        assert statuses.get(9) == "PASS", (
+            f"T26: V09 must PASS (countersignature validly re-minted by the pinned key) so that V12b "
+            f"is demonstrably the check that catches the identity mismatch; got check 9 = {statuses.get(9)}\n{out}"
+        )
+        print(f"PASS: T26 entry↔payload mismatch -> check 12 (V12b) FAIL, check 9 (V09) PASS (full FAIL set: {sorted(failed)})")
+
+    total = len(_TAMPER_CASES) + 2
+    print(f"\nOK: all {total} tamper cases produced their expected result(s) (14 field mutations + T25 + T26)")
 
 
 if __name__ == "__main__":
