@@ -252,11 +252,11 @@ def test_full_http_flow(kms_key: rsa.RSAPrivateKey) -> None:
         aaguid=aaguid,
     )
 
+    # SCR-002: rp_id / origin are NOT sent by the client; the server verifies
+    # against get_rp_config (overridden above to RP_ID / ORIGIN).
     registration_body = {
         "tenant_id": str(tenant_id),
         "user_id": str(user_id),
-        "rp_id": RP_ID,
-        "origin": ORIGIN,
         "attestation_object_b64url": b64url_encode(attestation_object),
         "client_data_json_b64url": b64url_encode(client_data_json),
     }
@@ -269,12 +269,13 @@ def test_full_http_flow(kms_key: rsa.RSAPrivateKey) -> None:
     assert reg["aaguid"] == ALLOWLISTED_AAGUID
     assert reg["attestation_fmt"] == "packed"
     assert reg["allowlist_matched"] is True
-    print("PASS: registration begin -> complete")
+    print("PASS: registration begin -> complete (server-authoritative origin/rpId, SCR-002)")
 
-    # 4. Replaying the same (now-consumed) challenge is rejected.
+    # 4. Replaying the same (now-consumed) challenge is rejected with a coded error.
     resp = client.post("/v1/credentials/register/complete", json=registration_body)
     assert resp.status_code == 409, resp.text
-    print("PASS: registration challenge replay rejected (409)")
+    assert resp.json()["detail"]["code"] == "ATT-1001", resp.text
+    print("PASS: registration challenge replay rejected (409, ATT-1001)")
 
     # 5. Ceremony: begin.
     resp = client.post(
@@ -305,8 +306,6 @@ def test_full_http_flow(kms_key: rsa.RSAPrivateKey) -> None:
             "client_data_json_b64url": b64url_encode(cdj),
             "authenticator_data_b64url": b64url_encode(auth_data),
             "signature_b64url": b64url_encode(sig),
-            "rp_id": RP_ID,
-            "origin": ORIGIN,
             "tsa_url": None,
         },
     )
@@ -336,13 +335,13 @@ def test_full_http_flow(kms_key: rsa.RSAPrivateKey) -> None:
     assert "FAIL" not in output, output
     print("PASS: re-exported bundle verifies cleanly (0 FAIL) via verifier/verify_attestation.py")
 
-    # 10. Bundle export for a nonexistent ledger entry -> 404.
+    # 10. Bundle export for a nonexistent ledger entry -> 404 (ATT-3001).
     resp = client.get(f"/v1/tenants/{tenant_id}/ledger/{uuid.uuid4()}/bundle")
     assert resp.status_code == 404, resp.text
-    print("PASS: bundle export for unknown entry_id -> 404")
+    assert resp.json()["detail"]["code"] == "ATT-3001", resp.text
+    print("PASS: bundle export for unknown entry_id -> 404 (ATT-3001)")
 
-    # 11. Ceremony begin with an unknown credential_id -> 404
-    #     (_http_exception_for_ceremony_error's "unknown credential_id" branch).
+    # 11. Ceremony begin with an unknown credential_id -> 404 (ATT-2001).
     resp = client.post(
         "/v1/ceremonies/begin",
         json={
@@ -355,7 +354,8 @@ def test_full_http_flow(kms_key: rsa.RSAPrivateKey) -> None:
         },
     )
     assert resp.status_code == 404, resp.text
-    print("PASS: ceremony begin with unknown credential_id -> 404")
+    assert resp.json()["detail"]["code"] == "ATT-2001", resp.text
+    print("PASS: ceremony begin with unknown credential_id -> 404 (ATT-2001)")
 
     app.dependency_overrides.clear()
 

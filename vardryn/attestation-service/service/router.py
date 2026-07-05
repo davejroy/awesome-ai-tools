@@ -20,8 +20,8 @@ ENGINEERING-CONFIDENCE NOTES (read before deploying):
    `google-cloud-storage`. Neither package is installed in this dev
    environment (no GCP project is provisioned here — same caveat as
    service/kms_countersign.py and service/snapshot_archive.py), so these
-   raise a clear `RuntimeError` at first use rather than an opaque
-   `ImportError`. tests/test_router.py overrides both via
+   raise a clear 503 (ATT-4001 / ATT-4002, service/errors.py) at first use
+   rather than an opaque `ImportError`. tests/test_router.py overrides both via
    `app.dependency_overrides` with the same FakeKmsClient /
    FakeSnapshotArchiver used by tests/test_webauthn_ceremony.py, so the
    HTTP layer itself IS exercised end-to-end — only the live-cloud wiring
@@ -67,7 +67,7 @@ from fastapi import APIRouter, Depends, FastAPI, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.exc import IntegrityError
 
-from . import models
+from . import errors, models
 from .bundle import build_bundle
 from .db import tenant_session
 from .entry_hash import ENTRY_HASH_FIELDS
@@ -91,14 +91,19 @@ def get_countersigner() -> KmsCountersigner:
     try:
         from google.cloud import kms_v1
     except ImportError as exc:
-        raise RuntimeError(
-            "google-cloud-kms is not installed; cannot construct a live "
-            "KmsCountersigner (service/kms_countersign.py)."
+        raise errors.http_exception(
+            errors.KMS_UNAVAILABLE,
+            "google-cloud-kms is not installed; cannot construct a live KmsCountersigner.",
         ) from exc
+
+    try:
+        key_version_name = os.environ["KMS_KEY_VERSION_NAME"]
+    except KeyError as exc:
+        raise errors.http_exception(errors.KMS_UNAVAILABLE, "KMS_KEY_VERSION_NAME is not set.") from exc
 
     return KmsCountersigner(
         client=kms_v1.KeyManagementServiceClient(),
-        key_version_name=os.environ["KMS_KEY_VERSION_NAME"],
+        key_version_name=key_version_name,
     )
 
 
@@ -108,15 +113,17 @@ def get_snapshot_archiver() -> SnapshotArchiver:
     try:
         from google.cloud import storage
     except ImportError as exc:
-        raise RuntimeError(
-            "google-cloud-storage is not installed; cannot construct a live "
-            "GcsSnapshotArchiver (service/snapshot_archive.py)."
+        raise errors.http_exception(
+            errors.GCS_UNAVAILABLE,
+            "google-cloud-storage is not installed; cannot construct a live GcsSnapshotArchiver.",
         ) from exc
 
-    return GcsSnapshotArchiver(
-        client=storage.Client(),
-        bucket_name=os.environ["SNAPSHOT_BUCKET_NAME"],
-    )
+    try:
+        bucket_name = os.environ["SNAPSHOT_BUCKET_NAME"]
+    except KeyError as exc:
+        raise errors.http_exception(errors.GCS_UNAVAILABLE, "SNAPSHOT_BUCKET_NAME is not set.") from exc
+
+    return GcsSnapshotArchiver(client=storage.Client(), bucket_name=bucket_name)
 
 
 @dataclass(frozen=True)
@@ -126,8 +133,14 @@ class RpConfig:
 
 
 def get_rp_config() -> RpConfig:
-    """See module docstring note 3."""
-    return RpConfig(rp_id=os.environ["ATTESTATION_RP_ID"], origin=os.environ["ATTESTATION_ORIGIN"])
+    """Server-authoritative relying-party identity (see module docstring note 3).
+    Used at registration/ceremony COMPLETION to verify the WebAuthn origin/rpId
+    against configuration the client cannot influence (SCR-002), and for bundle
+    re-export."""
+    try:
+        return RpConfig(rp_id=os.environ["ATTESTATION_RP_ID"], origin=os.environ["ATTESTATION_ORIGIN"])
+    except KeyError as exc:
+        raise errors.http_exception(errors.RP_CONFIG_MISSING) from exc
 
 
 # ── Registration challenge store (see module docstring note 2) ─────────────
@@ -168,18 +181,29 @@ _registration_challenges = _RegistrationChallengeStore()
 
 
 def _http_exception_for_ceremony_error(exc: CeremonyError) -> HTTPException:
-    """See module docstring note 4."""
+    """Maps a CeremonyError (untyped; see module docstring note 4) to a stable
+    error code (service/errors.py). The full original message is always carried
+    in the response detail regardless of the mapped code."""
     message = str(exc)
     if "unknown credential_id" in message:
-        return HTTPException(status_code=404, detail=message)
-    if "does not belong to user" in message:
-        return HTTPException(status_code=403, detail=message)
-    if "assertion verification failed" in message:
-        return HTTPException(status_code=400, detail=message)
-    # "unknown, already consumed, or expired" challenge; "ledger chain
-    # advanced"; "signCount did not increase" — all mean "this ceremony did
-    # not complete; begin a fresh one and retry".
-    return HTTPException(status_code=409, detail=message)
+        code = errors.CEREMONY_UNKNOWN_CREDENTIAL
+    elif "does not belong to user" in message:
+        code = errors.CEREMONY_CREDENTIAL_WRONG_USER
+    elif "assertion verification failed" in message:
+        code = errors.CEREMONY_ASSERTION_FAILED
+    elif "signer credential" in message and "not found" in message:
+        # Internal inconsistency (pending challenge references a missing
+        # credential) — retrying a fresh ceremony cannot help (SCR-004).
+        code = errors.CEREMONY_CREDENTIAL_MISSING
+    elif "signCount" in message:
+        code = errors.CEREMONY_SIGN_COUNT
+    elif "chain advanced" in message:
+        code = errors.CEREMONY_CHAIN_ADVANCED
+    elif "consumed" in message or "expired" in message:
+        code = errors.CEREMONY_CHALLENGE_INVALID
+    else:
+        code = errors.CEREMONY_CONFLICT
+    return errors.http_exception(code, message)
 
 
 # ── Registration ─────────────────────────────────────────────────────────────
@@ -197,10 +221,12 @@ def begin_registration() -> BeginRegistrationResponse:
 
 
 class CompleteRegistrationRequest(BaseModel):
+    # NOTE (SCR-002): rp_id / origin are NOT accepted from the client. The
+    # WebAuthn origin/rpId are verified against server-authoritative config
+    # (get_rp_config), so a client cannot register a credential minted at a
+    # phishing origin by declaring its own expected origin.
     tenant_id: UUID
     user_id: UUID
-    rp_id: str
-    origin: str
     attestation_object_b64url: str
     client_data_json_b64url: str
 
@@ -213,25 +239,28 @@ class CompleteRegistrationResponse(BaseModel):
 
 
 @router.post("/v1/credentials/register/complete", response_model=CompleteRegistrationResponse, status_code=201)
-def complete_registration(req: CompleteRegistrationRequest) -> CompleteRegistrationResponse:
+def complete_registration(
+    req: CompleteRegistrationRequest,
+    rp_config: RpConfig = Depends(get_rp_config),
+) -> CompleteRegistrationResponse:
     client_data_json = b64url_decode(req.client_data_json_b64url)
     challenge_b64url = parse_client_data_json(client_data_json).get("challenge", "")
 
     try:
         _registration_challenges.consume(challenge_b64url)
     except RegistrationChallengeError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise errors.http_exception(errors.REG_CHALLENGE_INVALID, str(exc)) from exc
 
     try:
         result = verify_registration(
             attestation_object=b64url_decode(req.attestation_object_b64url),
             client_data_json=client_data_json,
             expected_challenge=b64url_decode(challenge_b64url),
-            expected_origin=req.origin,
-            expected_rp_id=req.rp_id,
+            expected_origin=rp_config.origin,
+            expected_rp_id=rp_config.rp_id,
         )
     except RegistrationVerificationError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise errors.http_exception(errors.REG_VERIFICATION_FAILED, str(exc)) from exc
 
     credential_id_str = b64url_encode(result.credential_id)
 
@@ -254,7 +283,9 @@ def complete_registration(req: CompleteRegistrationRequest) -> CompleteRegistrat
                 )
             )
     except IntegrityError as exc:
-        raise HTTPException(status_code=409, detail=f"credential {credential_id_str!r} is already registered") from exc
+        raise errors.http_exception(
+            errors.REG_CREDENTIAL_EXISTS, f"credential {credential_id_str!r} is already registered"
+        ) from exc
 
     return CompleteRegistrationResponse(
         credential_id=credential_id_str,
@@ -308,13 +339,13 @@ def begin(req: BeginCeremonyRequest) -> BeginCeremonyResponse:
 
 
 class CompleteCeremonyRequest(BaseModel):
+    # NOTE (SCR-002): rp_id / origin are verified against server config
+    # (get_rp_config), not accepted from the client.
     tenant_id: UUID
     challenge_b64url: str
     client_data_json_b64url: str
     authenticator_data_b64url: str
     signature_b64url: str
-    rp_id: str
-    origin: str
     tsa_url: str | None = None
 
 
@@ -329,6 +360,7 @@ class CompleteCeremonyResponse(BaseModel):
 @router.post("/v1/ceremonies/complete", response_model=CompleteCeremonyResponse, status_code=201)
 def complete(
     req: CompleteCeremonyRequest,
+    rp_config: RpConfig = Depends(get_rp_config),
     countersigner: KmsCountersigner = Depends(get_countersigner),
     archiver: SnapshotArchiver = Depends(get_snapshot_archiver),
 ) -> CompleteCeremonyResponse:
@@ -341,8 +373,8 @@ def complete(
                 client_data_json=b64url_decode(req.client_data_json_b64url),
                 authenticator_data=b64url_decode(req.authenticator_data_b64url),
                 signature=b64url_decode(req.signature_b64url),
-                rp_id=req.rp_id,
-                origin=req.origin,
+                rp_id=rp_config.rp_id,
+                origin=rp_config.origin,
                 countersigner=countersigner,
                 archiver=archiver,
                 tsa_url=req.tsa_url,
@@ -373,11 +405,13 @@ def get_bundle(
     with tenant_session(tenant_id) as session:
         entry = session.get(models.AttestationLedgerEntry, entry_id)
         if entry is None:
-            raise HTTPException(status_code=404, detail=f"ledger entry {entry_id} not found")
+            raise errors.http_exception(errors.LEDGER_ENTRY_NOT_FOUND, f"ledger entry {entry_id} not found")
 
         credential = session.get(models.AttestationCredential, entry.signer_credential_id)
         if credential is None:
-            raise HTTPException(status_code=404, detail=f"credential {entry.signer_credential_id!r} not found")
+            raise errors.http_exception(
+                errors.LEDGER_CREDENTIAL_NOT_FOUND, f"credential {entry.signer_credential_id!r} not found"
+            )
 
         snapshot_bytes = archiver.retrieve(entry.snapshot_uri)
 

@@ -95,8 +95,34 @@ def test_typescript_matches_frozen_vectors() -> None:
         )
 
 
+def test_rejects_unsafe_numbers() -> None:
+    """SCR-003: integers outside the IEEE-754 safe range and any non-integer
+    float must RAISE (rather than emit bytes that diverge from canonical/jcs.ts,
+    which rejects both via Number.isSafeInteger / the float guard)."""
+    must_reject = [
+        2**53,            # first unsafe integer
+        2**53 + 1,
+        -(2**53),
+        10**21,           # large integer
+        1.5,              # non-integer float
+        float("nan"),
+        float("inf"),
+    ]
+    for value in must_reject:
+        try:
+            canonicalize(value)
+        except (ValueError, TypeError):
+            continue
+        raise AssertionError(f"canonicalize({value!r}) should have raised but did not")
+
+    # Boundary: the largest safe integer is still accepted.
+    assert canonicalize(2**53 - 1) == b"9007199254740991"
+
+
 if __name__ == "__main__":
     test_python_matches_frozen_vectors()
     print(f"OK: {len(load_vectors())} vectors verified against jcs.py")
+    test_rejects_unsafe_numbers()
+    print("OK: unsafe-integer / non-integer-float rejection verified (SCR-003)")
     test_typescript_matches_frozen_vectors()
     print("OK: jcs.ts cross-check complete (or skipped)")

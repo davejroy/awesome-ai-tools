@@ -44,6 +44,18 @@ def _encode(value: Any) -> str:
     if isinstance(value, str):
         return _encode_string(value)
     if isinstance(value, int):
+        # RFC 8785 §3.2.2.3: JSON numbers are IEEE-754 doubles. Integers
+        # outside the safe-integer range (±(2^53-1)) cannot be guaranteed to
+        # match ECMA-262 Number::toString, and canonical/jcs.ts rejects them
+        # (Number.isSafeInteger). Reject here too so the two implementations
+        # never diverge. The attestation schema uses only small non-negative
+        # integers (seq), so this is unreachable on the signing/hash path.
+        if abs(value) > 2**53 - 1:
+            raise ValueError(
+                f"Integer {value!r} is outside the IEEE-754 safe-integer range "
+                "(±(2^53-1)); RFC 8785 / ECMA-262 Number::toString parity is not "
+                "guaranteed and canonical/jcs.ts rejects it."
+            )
         return str(value)
     if isinstance(value, float):
         return _encode_number(value)
