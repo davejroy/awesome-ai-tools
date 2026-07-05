@@ -81,12 +81,30 @@ New tests: `action_body` strings-only (ATT-2008), `get_tsa_url` server-authorita
 
 **Re-test:** full suite green.
 
+## Round 3 — convergence check
+
+Two reviewers: (a) verify the Round-2 fixes; (b) a final skeptical holistic
+sweep with a HIGH bar, instructed to answer honestly "converged" if true.
+
+- Reviewer (a): **NO ACTIONABLE FINDINGS.** SSRF closed (no client value reaches
+  `requests.post`); the bounded TSA read does not truncate a real token; the
+  `action_body` strings-only check rejects int/float/bool/None at any depth and
+  runs before any DB work; middleware envelope consistent; `UnicodeDecodeError`
+  and directory/permission cases in the verifier key parse are all handled.
+- Reviewer (b): **NO ACTIONABLE FINDINGS — converged.** Traced every trust edge;
+  confirmed the WebAuthn signature → `H` → payload → entry-identity (check 12) →
+  countersignature-over-`ENTRY_HASH_FIELDS` (check 9, pinned key) chain leaves no
+  field addable/removable/reorderable/swappable without breaking the hardware or
+  pinned countersignature; string-only signing path; all resource paths bounded;
+  never-crash holds. The verifier's trust of bundle-supplied
+  `credential.public_key_cose`/`rp` is not exploitable with a pinned key (caught
+  as T25) and is the documented SCR-001 SKIP behavior without one.
+
 ## Convergence
 
-Round 2's findings were lower-severity than Round 0/1 and fully fixed; the
-release-candidate sweep confirmed the security-critical invariants
-(tamper-evidence, canonicalization determinism, key pinning, identity binding,
-tenant isolation) hold. No open HIGH/CRITICAL code findings remain. Further
-rounds would yield diminishing returns against the documented, accepted
-limitations (WYSIWYS, MDS3, x5c/TSA-root, live-cloud, in-memory challenge store)
-and the naming/format spec-conformance items owned by Cowork. **Loop converged.**
+Rounds 0→3 show the expected decay: Round 0 found a CRITICAL (SCR-001); Round 1
+found ~14 HIGH/MEDIUM/LOW; Round 2 found 4 (incl. SCR-005, MEDIUM); Round 3 found
+**0**. Two independent Round-3 reviewers confirm no actionable code findings
+remain beyond the documented, accepted limitations (WYSIWYS, MDS3, x5c/TSA-root,
+live-cloud, in-memory challenge store) and the naming/format spec-conformance
+items owned by Cowork. **Loop converged.**
