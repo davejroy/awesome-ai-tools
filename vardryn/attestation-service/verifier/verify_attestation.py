@@ -75,6 +75,63 @@ _ENTRY_FIELDS = ENTRY_HASH_FIELDS + ("platform_sigs", "tsa_token", "created_at")
 # webauthn_primitives that would conflict with this script's flat layout.
 GENESIS_STRING = "vardryn.attestation.genesis/1.0"
 
+# ── Resource limits (20e T22–T24: malformed / oversized input must produce a
+# specific error code, never a crash or unbounded memory use) ────────────────
+MAX_BUNDLE_BYTES = 16 * 1024 * 1024   # a bundle file (JSON + base64 snapshot)
+MAX_SNAPSHOT_BYTES = 4 * 1024 * 1024  # decoded confirmation-view HTML
+MAX_TSA_TOKEN_BYTES = 256 * 1024      # decoded RFC 3161 token
+MAX_PEM_BYTES = 64 * 1024             # a pinned platform-key PEM file
+
+# Exit codes: 0 = all checks PASS/SKIP; 1 = at least one check FAIL;
+# 2 = input/container error (could not even run the checks — T22/T23/T24).
+EXIT_OK = 0
+EXIT_CHECK_FAILED = 1
+EXIT_INPUT_ERROR = 2
+
+
+class VerifierInputError(Exception):
+    """A container/input problem (unreadable, oversized, or non-JSON bundle) —
+    reported as a named error with a one-line reason and EXIT_INPUT_ERROR,
+    never a raw traceback."""
+
+
+def _read_json_file(path: Path, *, max_bytes: int, label: str) -> dict:
+    """Size-bounded, error-mapped JSON file load. Raises VerifierInputError
+    (never an uncaught OSError/JSONDecodeError/RecursionError) on any problem."""
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        raise VerifierInputError(f"cannot stat {label} {path}: {exc}") from exc
+    if size > max_bytes:
+        raise VerifierInputError(
+            f"{label} {path} is {size} bytes, exceeding the {max_bytes}-byte limit (possible resource-exhaustion input)"
+        )
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise VerifierInputError(f"cannot read {label} {path}: {exc}") from exc
+    except UnicodeDecodeError as exc:
+        raise VerifierInputError(f"{label} {path} is not valid UTF-8: {exc}") from exc
+    try:
+        value = json.loads(text)
+    except (json.JSONDecodeError, RecursionError) as exc:
+        raise VerifierInputError(f"{label} {path} is not valid JSON: {exc}") from exc
+    if not isinstance(value, dict):
+        raise VerifierInputError(f"{label} {path} must be a JSON object, got {type(value).__name__}")
+    return value
+
+
+def _bounded_b64decode(data: str, *, max_bytes: int, field: str, urlsafe: bool = False) -> bytes:
+    """base64-decode with an output-size bound so an oversized field raises
+    (caught by the per-check handler → FAIL) instead of exhausting memory."""
+    # 4 base64 chars encode 3 bytes; bound the encoded length before decoding.
+    if len(data) > (max_bytes // 3 + 1) * 4 + 4:
+        raise ValueError(f"{field} exceeds the {max_bytes}-byte decoded-size limit")
+    raw = (base64.urlsafe_b64decode if urlsafe else base64.b64decode)(data)
+    if len(raw) > max_bytes:
+        raise ValueError(f"{field} decoded to {len(raw)} bytes, exceeding the {max_bytes}-byte limit")
+    return raw
+
 
 @dataclass
 class CheckResult:
@@ -140,7 +197,7 @@ def check_04_snapshot_hash(bundle: dict) -> tuple[str, str]:
     entry = bundle["entry"]
     payload = bundle["payload"]
 
-    snapshot_bytes = base64.b64decode(bundle["snapshot"])
+    snapshot_bytes = _bounded_b64decode(bundle["snapshot"], max_bytes=MAX_SNAPSHOT_BYTES, field="snapshot")
     computed = b64url_encode(hashlib.sha512(snapshot_bytes).digest())
 
     if computed != entry["snapshot_hash"]:
@@ -382,7 +439,7 @@ def check_10_tsa_token(bundle: dict, entry_hash: bytes) -> tuple[str, str]:
         return "SKIP", "asn1crypto is not installed; cannot verify entry.tsa_token (optional dependency)"
 
     try:
-        token_der = base64.b64decode(tsa_token)
+        token_der = _bounded_b64decode(tsa_token, max_bytes=MAX_TSA_TOKEN_BYTES, field="tsa_token")
         result = verify_timestamp_token(token_der, entry_hash)
     except TsaVerificationError as exc:
         return "FAIL", f"tsa_token does not verify: {exc}"
@@ -477,13 +534,21 @@ def run_checks(
 
 def _parse_platform_key_args(specs: list[str] | None) -> dict[str, str]:
     """Parses repeated --platform-key KEY_REF=PATH args into {key_ref: pem_text}.
-    KEY_REF is the full KMS key-version resource name (== platform_sigs[].kms_key_version)."""
+    KEY_REF is the full KMS key-version resource name (== platform_sigs[].kms_key_version).
+    Raises VerifierInputError (mapped to EXIT_INPUT_ERROR) on a malformed spec or
+    an unreadable/oversized PEM file — never an uncaught traceback."""
     trusted: dict[str, str] = {}
     for spec in specs or []:
         if "=" not in spec:
-            raise SystemExit(f"--platform-key must be KEY_REF=PATH, got {spec!r}")
-        key_ref, path = spec.split("=", 1)
-        trusted[key_ref] = Path(path).read_text(encoding="ascii")
+            raise VerifierInputError(f"--platform-key must be KEY_REF=PATH, got {spec!r}")
+        key_ref, path_str = spec.split("=", 1)
+        path = Path(path_str)
+        try:
+            if path.stat().st_size > MAX_PEM_BYTES:
+                raise VerifierInputError(f"--platform-key file {path} exceeds {MAX_PEM_BYTES} bytes")
+            trusted[key_ref] = path.read_text(encoding="ascii")
+        except OSError as exc:
+            raise VerifierInputError(f"cannot read --platform-key file {path}: {exc}") from exc
     return trusted
 
 
@@ -510,9 +575,21 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    bundle = json.loads(args.bundle.read_text(encoding="utf-8"))
-    prev_bundle = json.loads(args.prev_bundle.read_text(encoding="utf-8")) if args.prev_bundle else None
-    trusted_platform_keys = _parse_platform_key_args(args.platform_key)
+    # Load all inputs defensively: a malformed, oversized, or unreadable bundle
+    # must yield a named [INPUT ERROR] line and EXIT_INPUT_ERROR — never a raw
+    # traceback (20d "never crash, never generic error"; 20e T22/T23/T24).
+    try:
+        bundle = _read_json_file(args.bundle, max_bytes=MAX_BUNDLE_BYTES, label="bundle")
+        prev_bundle = (
+            _read_json_file(args.prev_bundle, max_bytes=MAX_BUNDLE_BYTES, label="--prev-bundle")
+            if args.prev_bundle
+            else None
+        )
+        trusted_platform_keys = _parse_platform_key_args(args.platform_key)
+    except VerifierInputError as exc:
+        print(f"[INPUT ERROR] {exc}")
+        print("\n0 passed, 0 skipped, 0 failed (input could not be loaded)")
+        return EXIT_INPUT_ERROR
 
     results = run_checks(bundle, prev_bundle, trusted_platform_keys)
 
@@ -526,7 +603,7 @@ def main() -> int:
     print()
     print(f"{passed} passed, {skipped} skipped, {failed} failed (of {len(results)})")
 
-    return 1 if failed else 0
+    return EXIT_CHECK_FAILED if failed else EXIT_OK
 
 
 if __name__ == "__main__":

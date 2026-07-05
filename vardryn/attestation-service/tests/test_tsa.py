@@ -194,9 +194,53 @@ def test_tampered_signature_rejected() -> None:
     raise AssertionError("expected TsaVerificationError")
 
 
+def _load_verifier_tsa_verify():
+    """Load verifier/tsa_verify.py as a standalone module (it is a hand-trimmed
+    copy of service/tsa.py's verification path, not one of the byte-identical
+    vendored modules) so we can assert the two implementations still AGREE."""
+    import importlib.util
+
+    path = Path(__file__).resolve().parent.parent / "verifier" / "tsa_verify.py"
+    spec = importlib.util.spec_from_file_location("verifier_tsa_verify", path)
+    module = importlib.util.module_from_spec(spec)
+    # Register before exec so @dataclass in the module can resolve its own
+    # __module__ during class creation (dataclasses looks it up in sys.modules).
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_verifier_tsa_verify_agrees_with_service() -> None:
+    """Drift guard (SDLC finding): service/tsa.py and verifier/tsa_verify.py
+    duplicate the CMS/RFC-3161 verification logic. The offline verifier's copy is
+    the security-critical one; a fix landing in only one would silently diverge.
+    Assert both accept a valid synthetic token and both reject a tampered one."""
+    vtv = _load_verifier_tsa_verify()
+    entry_hash = hashlib.sha512(b"drift-guard entry").digest()
+
+    good = _build_synthetic_token(entry_hash)
+    bad = _build_synthetic_token(entry_hash, tamper_signature=True)
+
+    # Both accept the good token (verifier copy takes no expected_hash_algorithm kwarg).
+    verify_timestamp_token(good, entry_hash, expected_hash_algorithm="sha512")
+    vtv.verify_timestamp_token(good, entry_hash)
+
+    # Both reject the tampered token.
+    for label, fn in (("service", lambda: verify_timestamp_token(bad, entry_hash, expected_hash_algorithm="sha512")),
+                      ("verifier", lambda: vtv.verify_timestamp_token(bad, entry_hash))):
+        try:
+            fn()
+        except Exception:
+            continue
+        raise AssertionError(f"{label} verify_timestamp_token accepted a tampered token")
+
+    print("PASS: service/tsa and verifier/tsa_verify agree (accept valid, reject tampered)")
+
+
 if __name__ == "__main__":
     test_build_timestamp_request_round_trips()
     test_verify_synthetic_token_happy_path()
     test_message_imprint_mismatch_rejected()
     test_tampered_signature_rejected()
+    test_verifier_tsa_verify_agrees_with_service()
     print("\nOK: all tsa tests passed")

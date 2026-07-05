@@ -62,7 +62,7 @@ from service.router import (  # noqa: E402
     get_rp_config,
     get_snapshot_archiver,
 )
-from service.webauthn_primitives import b64url_decode, b64url_encode  # noqa: E402
+from service.webauthn_primitives import b64url_encode  # noqa: E402
 
 VERIFY_SCRIPT = ROOT / "verifier" / "verify_attestation.py"
 
@@ -356,6 +356,25 @@ def test_full_http_flow(kms_key: rsa.RSAPrivateKey) -> None:
     assert resp.status_code == 404, resp.text
     assert resp.json()["detail"]["code"] == "ATT-2001", resp.text
     print("PASS: ceremony begin with unknown credential_id -> 404 (ATT-2001)")
+
+    # 12. Health endpoint (liveness).
+    resp = client.get("/health")
+    assert resp.status_code == 200 and resp.json()["status"] == "ok", resp.text
+    print("PASS: GET /health -> 200 ok")
+
+    # 13. Oversized request body -> 413 (ATT-9001), rejected before parsing.
+    huge = {
+        "tenant_id": str(tenant_id),
+        "user_id": str(user_id),
+        "credential_id": credential_id,
+        "action_type": "control.approve",
+        "action_body": {"blob": "A" * (2 * 1024 * 1024)},  # ~2 MiB > 1 MiB limit
+        "ial_record": "IAL2",
+    }
+    resp = client.post("/v1/ceremonies/begin", json=huge)
+    assert resp.status_code == 413, resp.text
+    assert resp.json()["code"] == "ATT-9001", resp.text
+    print("PASS: oversized request body -> 413 (ATT-9001)")
 
     app.dependency_overrides.clear()
 

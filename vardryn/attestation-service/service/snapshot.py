@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import html
+import json
 
 CONFIRMATION_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
@@ -41,10 +42,7 @@ CONFIRMATION_TEMPLATE = """<!DOCTYPE html>
      signature — the signature covers a hash of this page.</p>
 
   <div class="field"><div class="label">Action type</div><div class="value">{action_type}</div></div>
-  <div class="field"><div class="label">Decision</div><div class="value">{decision}</div></div>
-  <div class="field"><div class="label">Control</div><div class="value">{control_id}</div></div>
-  <div class="field"><div class="label">Evidence SHA-512</div><div class="value">{evidence_sha512}</div></div>
-  <div class="field"><div class="label">Statement</div><div class="value">{statement}</div></div>
+{action_fields}
   <div class="field"><div class="label">Timestamp (UTC)</div><div class="value">{timestamp}</div></div>
   <div class="field"><div class="label">Actor</div><div class="value">{user_id}</div></div>
 
@@ -58,6 +56,19 @@ CONFIRMATION_TEMPLATE = """<!DOCTYPE html>
 """
 
 
+def _stringify(value: object) -> str:
+    """Human-readable rendering of one action_body value. Scalars render as
+    their string form; nested objects/arrays render as compact sorted-key JSON
+    so that EVERY signed byte is visible in the confirmation view."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, bool) or value is None:
+        return json.dumps(value)  # true / false / null
+    if isinstance(value, (int, float)):
+        return str(value)
+    return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+
+
 def render_confirmation_view(
     *,
     action_type: str,
@@ -69,13 +80,29 @@ def render_confirmation_view(
     Returns the exact UTF-8 bytes to be served to the browser. Must be
     called BEFORE service/payload.py:build_payload(), since its output
     feeds `snapshot_hash`, which is itself a field of P.
+
+    EVERY key of `action_body` is rendered (sorted for determinism), because
+    `build_payload` binds the entire `action_body` dict into the signed
+    payload P. Rendering only a subset would let a field be signed by the
+    human without ever being shown to them — see the note in payload.py and
+    the SCR/finding this addresses. The field labels are derived from the
+    (untrusted) `action_body` keys, so they are HTML-escaped too.
     """
+    field_rows = []
+    for key in sorted(action_body.keys()):
+        label = html.escape(str(key))
+        value = html.escape(_stringify(action_body[key]))
+        field_rows.append(
+            f'  <div class="field"><div class="label">{label}</div><div class="value">{value}</div></div>'
+        )
+    action_fields = "\n".join(field_rows)
+
+    # action_fields is passed as a FORMAT ARGUMENT (not spliced into the
+    # template string), so any '{'/'}' inside escaped user values is never
+    # interpreted by str.format.
     rendered = CONFIRMATION_TEMPLATE.format(
         action_type=html.escape(action_type),
-        decision=html.escape(str(action_body.get("decision", ""))),
-        control_id=html.escape(str(action_body.get("control_id", ""))),
-        evidence_sha512=html.escape(str(action_body.get("evidence_sha512", ""))),
-        statement=html.escape(str(action_body.get("statement", ""))),
+        action_fields=action_fields,
         timestamp=html.escape(timestamp),
         user_id=html.escape(user_id),
     )

@@ -19,7 +19,6 @@ Run directly: `DATABASE_URL=postgresql+psycopg2://attestation_app:test@127.0.0.1
 
 from __future__ import annotations
 
-import os
 import sys
 import uuid
 from datetime import datetime, timedelta, timezone

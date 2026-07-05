@@ -55,7 +55,7 @@ from service.kms_countersign import KmsCountersigner  # noqa: E402
 from service.payload import genesis_hash  # noqa: E402
 from service.platform_signature import verify_platform_sig_entry  # noqa: E402
 from service.webauthn_ceremony import CeremonyError, begin_ceremony, complete_ceremony  # noqa: E402
-from service.webauthn_primitives import b64url_decode, b64url_encode  # noqa: E402
+from service.webauthn_primitives import b64url_encode  # noqa: E402
 
 RP_ID = "vardryn.example"
 ORIGIN = "https://vardryn.example"

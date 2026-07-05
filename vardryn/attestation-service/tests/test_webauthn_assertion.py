@@ -15,7 +15,6 @@ import struct
 import sys
 from pathlib import Path
 
-import cbor2
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.ec import ECDSA

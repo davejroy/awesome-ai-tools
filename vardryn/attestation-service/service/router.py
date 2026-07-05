@@ -55,6 +55,7 @@ ENGINEERING-CONFIDENCE NOTES (read before deploying):
 from __future__ import annotations
 
 import json
+import logging
 import os
 import secrets
 import threading
@@ -64,6 +65,7 @@ from uuid import UUID
 
 import cbor2
 from fastapi import APIRouter, Depends, FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy.exc import IntegrityError
 
@@ -76,6 +78,12 @@ from .snapshot_archive import GcsSnapshotArchiver, SnapshotArchiver
 from .webauthn_ceremony import CeremonyError, begin_ceremony, complete_ceremony
 from .webauthn_primitives import b64url_decode, b64url_encode, parse_client_data_json
 from .webauthn_registration import RegistrationVerificationError, verify_registration
+
+logger = logging.getLogger("vardryn.attestation")
+
+# Reject request bodies larger than this before parsing (defense against
+# resource-exhaustion via an oversized action_body / attestation object).
+MAX_REQUEST_BODY_BYTES = 1 * 1024 * 1024  # 1 MiB
 
 router = APIRouter()
 
@@ -383,6 +391,10 @@ def complete(
         raise _http_exception_for_ceremony_error(exc) from exc
 
     entry = result.entry
+    logger.info(
+        "ceremony.complete",
+        extra={"tenant_id": str(req.tenant_id), "entry_id": str(entry.entry_id), "seq": entry.seq},
+    )
     return CompleteCeremonyResponse(
         entry_id=entry.entry_id,
         seq=entry.seq,
@@ -443,7 +455,41 @@ def get_bundle(
     return bundle
 
 
+# ── Health ───────────────────────────────────────────────────────────────────
+
+
+@router.get("/health")
+def health() -> dict:
+    """Liveness probe. Does NOT check KMS/GCS/DB reachability (those surface as
+    per-request 503s, ATT-4001/4002) — it only confirms the process is up."""
+    return {"status": "ok", "service": "vardryn-attestation"}
+
+
 # ── App ──────────────────────────────────────────────────────────────────────
 
 app = FastAPI(title="Vardryn Attestation Service")
+
+
+@app.middleware("http")
+async def _limit_request_body(request, call_next):
+    """Reject oversized request bodies before they are parsed (413). Guards the
+    unbounded `action_body` / attestation-object fields against resource
+    exhaustion. Streaming/chunked requests without Content-Length are allowed
+    through to the endpoint (the DB/pydantic layers still bound real usage)."""
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            too_large = int(content_length) > MAX_REQUEST_BODY_BYTES
+        except ValueError:
+            code = errors.BAD_CONTENT_LENGTH
+            return JSONResponse(status_code=code.http_status, content={"code": code.code, "message": code.summary})
+        if too_large:
+            code = errors.REQUEST_TOO_LARGE
+            return JSONResponse(
+                status_code=code.http_status,
+                content={"code": code.code, "message": f"request body exceeds {MAX_REQUEST_BODY_BYTES} bytes"},
+            )
+    return await call_next(request)
+
+
 app.include_router(router)

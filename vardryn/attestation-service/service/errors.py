@@ -60,6 +60,8 @@ RP_CONFIG_MISSING = ErrorCode("ATT-4003", 500, "Relying-party configuration (ATT
 
 # ── Generic (9xxx) ───────────────────────────────────────────────────────────
 UNEXPECTED = ErrorCode("ATT-9000", 500, "Unexpected server error")
+REQUEST_TOO_LARGE = ErrorCode("ATT-9001", 413, "Request body exceeds the maximum allowed size")
+BAD_CONTENT_LENGTH = ErrorCode("ATT-9002", 400, "Invalid Content-Length header")
 
 
 ALL_ERROR_CODES: tuple[ErrorCode, ...] = (
@@ -80,6 +82,8 @@ ALL_ERROR_CODES: tuple[ErrorCode, ...] = (
     GCS_UNAVAILABLE,
     RP_CONFIG_MISSING,
     UNEXPECTED,
+    REQUEST_TOO_LARGE,
+    BAD_CONTENT_LENGTH,
 )
 
 
