@@ -96,6 +96,24 @@ def test_missing_platform_key_file() -> None:
         p.unlink()
 
 
+def test_non_ascii_platform_key_file() -> None:
+    # A binary/non-ASCII PEM file must yield a named input error (exit 2), not a
+    # crash — UnicodeDecodeError is a ValueError, not an OSError (Round-2 finding).
+    p = _write(json.dumps({"schema": "x"}))
+    keyf = tempfile.NamedTemporaryFile(suffix=".pem", delete=False)
+    keyf.write(b"\xff\xfe not a valid ascii pem \x00")
+    keyf.close()
+    try:
+        _assert_input_error(
+            _run(str(p), "--platform-key", f"k={keyf.name}"),
+            "not valid ASCII",
+            "non-ASCII --platform-key file -> exit 2",
+        )
+    finally:
+        p.unlink()
+        Path(keyf.name).unlink()
+
+
 if __name__ == "__main__":
     test_malformed_json()
     test_missing_bundle_file()
@@ -103,4 +121,5 @@ if __name__ == "__main__":
     test_oversized_bundle()
     test_bad_platform_key_spec()
     test_missing_platform_key_file()
+    test_non_ascii_platform_key_file()
     print("\nOK: all verifier CLI robustness tests passed")

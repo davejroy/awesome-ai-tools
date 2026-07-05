@@ -151,6 +151,19 @@ def get_rp_config() -> RpConfig:
         raise errors.http_exception(errors.RP_CONFIG_MISSING) from exc
 
 
+def get_tsa_url() -> str | None:
+    """Server-authoritative RFC 3161 TSA endpoint (SCR-005). Read from
+    `ATTESTATION_TSA_URL` (optional; unset => no timestamp). The TSA URL is NOT
+    accepted from the client: a client-supplied URL would be an authenticated
+    SSRF sink (the server POSTs to it). Only https endpoints are honored."""
+    url = os.environ.get("ATTESTATION_TSA_URL")
+    if url and not url.lower().startswith("https://"):
+        # Fail closed rather than POST to an unexpected scheme/host.
+        logger.warning("ignoring non-https ATTESTATION_TSA_URL")
+        return None
+    return url or None
+
+
 # ── Registration challenge store (see module docstring note 2) ─────────────
 
 
@@ -322,8 +335,27 @@ class BeginCeremonyResponse(BaseModel):
     expires_at: datetime
 
 
+def _assert_action_body_strings_only(value: object, path: str = "action_body") -> None:
+    """Enforce the strings-only signed-payload invariant at the API boundary
+    (SCR-005 follow-on): reject numbers/bools/None leaves before they reach
+    canonicalization (which would otherwise raise ValueError -> 500). Nested
+    dicts/lists are allowed; every scalar leaf must be a str."""
+    if isinstance(value, dict):
+        for k, v in value.items():
+            _assert_action_body_strings_only(v, f"{path}.{k}")
+    elif isinstance(value, list):
+        for i, v in enumerate(value):
+            _assert_action_body_strings_only(v, f"{path}[{i}]")
+    elif not isinstance(value, str):
+        raise errors.http_exception(
+            errors.CEREMONY_INVALID_ACTION_BODY,
+            f"{path} is {type(value).__name__}; only string values are allowed (strings-only signed payload)",
+        )
+
+
 @router.post("/v1/ceremonies/begin", response_model=BeginCeremonyResponse)
 def begin(req: BeginCeremonyRequest) -> BeginCeremonyResponse:
+    _assert_action_body_strings_only(req.action_body)
     try:
         with tenant_session(req.tenant_id) as session:
             result = begin_ceremony(
@@ -349,12 +381,13 @@ def begin(req: BeginCeremonyRequest) -> BeginCeremonyResponse:
 class CompleteCeremonyRequest(BaseModel):
     # NOTE (SCR-002): rp_id / origin are verified against server config
     # (get_rp_config), not accepted from the client.
+    # NOTE (SCR-005): tsa_url is NOT accepted from the client (it would be an
+    # authenticated SSRF sink); it comes from server config (get_tsa_url).
     tenant_id: UUID
     challenge_b64url: str
     client_data_json_b64url: str
     authenticator_data_b64url: str
     signature_b64url: str
-    tsa_url: str | None = None
 
 
 class CompleteCeremonyResponse(BaseModel):
@@ -369,6 +402,7 @@ class CompleteCeremonyResponse(BaseModel):
 def complete(
     req: CompleteCeremonyRequest,
     rp_config: RpConfig = Depends(get_rp_config),
+    tsa_url: str | None = Depends(get_tsa_url),
     countersigner: KmsCountersigner = Depends(get_countersigner),
     archiver: SnapshotArchiver = Depends(get_snapshot_archiver),
 ) -> CompleteCeremonyResponse:
@@ -385,7 +419,7 @@ def complete(
                 origin=rp_config.origin,
                 countersigner=countersigner,
                 archiver=archiver,
-                tsa_url=req.tsa_url,
+                tsa_url=tsa_url,
             )
     except CeremonyError as exc:
         raise _http_exception_for_ceremony_error(exc) from exc
@@ -476,19 +510,19 @@ async def _limit_request_body(request, call_next):
     unbounded `action_body` / attestation-object fields against resource
     exhaustion. Streaming/chunked requests without Content-Length are allowed
     through to the endpoint (the DB/pydantic layers still bound real usage)."""
+    def _error(code: errors.ErrorCode, message: str) -> JSONResponse:
+        # Same {"detail": {code, message}} envelope FastAPI uses for
+        # HTTPException, so clients read body["detail"]["code"] everywhere.
+        return JSONResponse(status_code=code.http_status, content={"detail": {"code": code.code, "message": message}})
+
     content_length = request.headers.get("content-length")
     if content_length is not None:
         try:
             too_large = int(content_length) > MAX_REQUEST_BODY_BYTES
         except ValueError:
-            code = errors.BAD_CONTENT_LENGTH
-            return JSONResponse(status_code=code.http_status, content={"code": code.code, "message": code.summary})
+            return _error(errors.BAD_CONTENT_LENGTH, errors.BAD_CONTENT_LENGTH.summary)
         if too_large:
-            code = errors.REQUEST_TOO_LARGE
-            return JSONResponse(
-                status_code=code.http_status,
-                content={"code": code.code, "message": f"request body exceeds {MAX_REQUEST_BODY_BYTES} bytes"},
-            )
+            return _error(errors.REQUEST_TOO_LARGE, f"request body exceeds {MAX_REQUEST_BODY_BYTES} bytes")
     return await call_next(request)
 
 

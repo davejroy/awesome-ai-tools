@@ -155,6 +155,7 @@ first three; the last two are only needed for a live cloud deployment.
 | `DATABASE_URL` | **Yes** | SQLAlchemy URL; must use the `attestation_app` role (not a superuser). Read in `service/db.py`. | `postgresql+psycopg2://attestation_app:test@127.0.0.1/attestation_test` |
 | `ATTESTATION_RP_ID` | **Yes** | WebAuthn Relying-Party ID; also used when re-exporting bundles (single-RP-per-deployment). | `vardryn.example` |
 | `ATTESTATION_ORIGIN` | **Yes** | Expected WebAuthn origin (scheme + host). Missing RP config surfaces as `ATT-4003`. | `https://vardryn.example` |
+| `ATTESTATION_TSA_URL` | Optional | RFC 3161 TSA endpoint (**https only**) for the optional trusted timestamp. Server-authoritative — never taken from the client (SCR-005). Unset ⇒ no timestamp. | `https://tsa.example/timestamp` |
 | `KMS_KEY_VERSION_NAME` | Live only | Cloud KMS key-version resource name used for RSA-PSS-4096-SHA512 countersignatures. Unused in dev. | `projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1` |
 | `SNAPSHOT_BUCKET_NAME` | Live only | GCS WORM bucket for the archived confirmation view. Unused in dev. | `my-worm-bucket` |
 

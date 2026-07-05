@@ -62,6 +62,17 @@ is strings-only (invariant I-strings), and `seq` is a small counter — but
   `2^53-1` and never exercise float rejection).
 - **Invariant impact:** none; strengthens JCS determinism / cross-impl agreement.
 
+### SCR-005 (MEDIUM — authenticated SSRF) — client-controlled `tsa_url` — FIXED
+Found in the Round-2 release-candidate sweep (`REVIEW-LOG.md`). `CompleteCeremonyRequest.tsa_url`
+was taken from the client and passed to `requests.post(tsa_url, ...)` server-side —
+an authenticated SSRF (any enrolled signer could make the server POST to arbitrary
+internal URLs, e.g. metadata/internal services) plus an unbounded-response memory DoS.
+Same class as SCR-002 (security-relevant values must be server-authoritative).
+- **Fix:** TSA URL is now server config only (`ATTESTATION_TSA_URL`, https-only,
+  `get_tsa_url`); removed from the request model; the TSA response read is bounded
+  (`MAX_TSA_RESPONSE_BYTES`, `stream=True`). Non-string `action_body` values (which
+  would raise in canonicalization) are rejected at the boundary with 400 `ATT-2008`.
+
 ### SCR-004 (LOW, cosmetic) — verifier error-mapping for internal-consistency failure — FIXED
 `service/router.py` `_http_exception_for_ceremony_error` maps the
 "signer credential … not found" `CeremonyError` (a should-not-happen internal

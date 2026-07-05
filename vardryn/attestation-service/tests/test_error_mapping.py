@@ -58,6 +58,28 @@ def test_error_codes_unique_and_well_formed() -> None:
     print(f"PASS: {len(codes)} error codes unique and well-formed")
 
 
+def test_get_tsa_url_server_authoritative() -> None:
+    """SCR-005: the TSA URL is server config (https-only), never client input."""
+    import os
+
+    from service.router import get_tsa_url
+
+    saved = os.environ.get("ATTESTATION_TSA_URL")
+    try:
+        os.environ.pop("ATTESTATION_TSA_URL", None)
+        assert get_tsa_url() is None
+        os.environ["ATTESTATION_TSA_URL"] = "http://evil.internal/ts"  # non-https -> ignored
+        assert get_tsa_url() is None
+        os.environ["ATTESTATION_TSA_URL"] = "https://tsa.example/ts"
+        assert get_tsa_url() == "https://tsa.example/ts"
+        print("PASS: get_tsa_url is server-authoritative, https-only (SCR-005)")
+    finally:
+        if saved is None:
+            os.environ.pop("ATTESTATION_TSA_URL", None)
+        else:
+            os.environ["ATTESTATION_TSA_URL"] = saved
+
+
 def test_http_exception_builder() -> None:
     exc = errors.http_exception(errors.LEDGER_ENTRY_NOT_FOUND)
     assert exc.status_code == 404
@@ -70,5 +92,6 @@ def test_http_exception_builder() -> None:
 if __name__ == "__main__":
     test_ceremony_error_mapping()
     test_error_codes_unique_and_well_formed()
+    test_get_tsa_url_server_authoritative()
     test_http_exception_builder()
     print("\nOK: all error-mapping / error-code tests passed")

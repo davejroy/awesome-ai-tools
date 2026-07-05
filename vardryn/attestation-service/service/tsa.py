@@ -97,6 +97,11 @@ def build_timestamp_request(
     return req.dump()
 
 
+# An RFC 3161 TimeStampResp is small (a few KB). Bound the response read so a
+# hostile/misconfigured TSA endpoint cannot exhaust memory (SCR-005).
+MAX_TSA_RESPONSE_BYTES = 256 * 1024
+
+
 def request_timestamp(
     entry_hash: bytes,
     *,
@@ -124,14 +129,21 @@ def request_timestamp(
                 "Accept": "application/timestamp-reply",
             },
             timeout=timeout,
+            stream=True,  # bound the response read (a TimeStampResp is small)
         )
     except requests.RequestException as exc:
         raise TsaError(f"TSA request to {tsa_url} failed: {exc}") from exc
 
-    if not response.ok:
-        raise TsaError(f"TSA {tsa_url} returned HTTP {response.status_code}")
+    with response:
+        if not response.ok:
+            raise TsaError(f"TSA {tsa_url} returned HTTP {response.status_code}")
 
-    return response.content
+        # Read at most MAX_TSA_RESPONSE_BYTES + 1 so an over-limit body is
+        # detected without materializing an unbounded response in memory.
+        content = response.raw.read(MAX_TSA_RESPONSE_BYTES + 1, decode_content=True)
+    if len(content) > MAX_TSA_RESPONSE_BYTES:
+        raise TsaError(f"TSA {tsa_url} response exceeds {MAX_TSA_RESPONSE_BYTES} bytes")
+    return content
 
 
 # ── Verification ─────────────────────────────────────────────────────────────

@@ -55,4 +55,38 @@ standalone-ness.
 
 **Re-test:** full suite green (11 test files) after fixes.
 
-_Round 2 and convergence are appended below as the loop continues._
+## Round 2 — post-hardening verification + release-candidate sweep
+
+Two reviewers: (a) verify the Round-1 fixes are correct / introduced no bug,
+(b) a fresh skeptical release-candidate sweep for anything still missed.
+
+**Findings fixed this round:**
+
+| # | Severity | Finding | Fix |
+| --- | --- | --- | --- |
+| SCR-005 | MEDIUM (authenticated SSRF) | `tsa_url` was taken from the client request body and POSTed server-side (`requests.post(tsa_url)`) — an authenticated SSRF + unbounded response DoS. Same class as SCR-002. | TSA URL is now **server config** (`ATTESTATION_TSA_URL`, https-only, `get_tsa_url`); removed from the request model; TSA response read is bounded (`MAX_TSA_RESPONSE_BYTES`, `stream=True`) |
+| R2-1 | LOW | Non-string `action_body` values raised an uncaught `ValueError` in canonicalization → opaque 500 (strings-only invariant unenforced) | Boundary validation `_assert_action_body_strings_only` → 400 `ATT-2008` |
+| R2-2 | MEDIUM | Verifier crashed with a raw traceback + wrong exit code (1) on a non-ASCII `--platform-key` file (`UnicodeDecodeError` is not an `OSError`) | Catch `UnicodeDecodeError` → `VerifierInputError` (exit 2) |
+| R2-3 | LOW | Body-limit middleware returned a flat `{code,message}` envelope, inconsistent with the `{detail:{...}}` shape of all other errors | Middleware now uses the `{detail:{code,message}}` envelope |
+
+Verified clean (no finding): check-9 multi-sig mixing (each sig verified against a
+freshly recomputed `entry_hash`), JCS collisions (string keys only on the parse
+path; `5`/`5.0` not exploitable), check-11 chain linkage, ceremony
+consume+insert atomicity, no private-key/secret leak in any FAIL/error detail,
+`snapshot.py` brace/escape safety, `_bounded_b64decode` bounds, verifier
+`main()` never-throw, middleware signature.
+
+New tests: `action_body` strings-only (ATT-2008), `get_tsa_url` server-authoritative
+(SCR-005), verifier non-ASCII `--platform-key`, middleware envelope assertion.
+
+**Re-test:** full suite green.
+
+## Convergence
+
+Round 2's findings were lower-severity than Round 0/1 and fully fixed; the
+release-candidate sweep confirmed the security-critical invariants
+(tamper-evidence, canonicalization determinism, key pinning, identity binding,
+tenant isolation) hold. No open HIGH/CRITICAL code findings remain. Further
+rounds would yield diminishing returns against the documented, accepted
+limitations (WYSIWYS, MDS3, x5c/TSA-root, live-cloud, in-memory challenge store)
+and the naming/format spec-conformance items owned by Cowork. **Loop converged.**

@@ -549,6 +549,10 @@ def _parse_platform_key_args(specs: list[str] | None) -> dict[str, str]:
             trusted[key_ref] = path.read_text(encoding="ascii")
         except OSError as exc:
             raise VerifierInputError(f"cannot read --platform-key file {path}: {exc}") from exc
+        except UnicodeDecodeError as exc:
+            # UnicodeDecodeError is a ValueError, not an OSError — catch it so a
+            # binary/non-ASCII PEM yields a named input error (exit 2), not a crash.
+            raise VerifierInputError(f"--platform-key file {path} is not valid ASCII PEM: {exc}") from exc
     return trusted
 
 

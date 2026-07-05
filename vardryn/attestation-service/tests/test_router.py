@@ -306,7 +306,7 @@ def test_full_http_flow(kms_key: rsa.RSAPrivateKey) -> None:
             "client_data_json_b64url": b64url_encode(cdj),
             "authenticator_data_b64url": b64url_encode(auth_data),
             "signature_b64url": b64url_encode(sig),
-            "tsa_url": None,
+            # SCR-005: tsa_url is NOT a request field; it comes from server config.
         },
     )
     assert resp.status_code == 201, resp.text
@@ -373,8 +373,24 @@ def test_full_http_flow(kms_key: rsa.RSAPrivateKey) -> None:
     }
     resp = client.post("/v1/ceremonies/begin", json=huge)
     assert resp.status_code == 413, resp.text
-    assert resp.json()["code"] == "ATT-9001", resp.text
+    assert resp.json()["detail"]["code"] == "ATT-9001", resp.text
     print("PASS: oversized request body -> 413 (ATT-9001)")
+
+    # 14. action_body with a non-string value -> 400 (ATT-2008), strings-only invariant.
+    resp = client.post(
+        "/v1/ceremonies/begin",
+        json={
+            "tenant_id": str(tenant_id),
+            "user_id": str(user_id),
+            "credential_id": credential_id,
+            "action_type": "control.approve",
+            "action_body": {"decision": "approve", "amount": 1000000},  # int leaf -> rejected
+            "ial_record": "IAL2",
+        },
+    )
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["detail"]["code"] == "ATT-2008", resp.text
+    print("PASS: non-string action_body value -> 400 (ATT-2008)")
 
     app.dependency_overrides.clear()
 

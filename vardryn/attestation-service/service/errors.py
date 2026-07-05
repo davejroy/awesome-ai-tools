@@ -47,6 +47,7 @@ CEREMONY_CHALLENGE_INVALID = ErrorCode("ATT-2004", 409, "Ceremony challenge is u
 CEREMONY_CHAIN_ADVANCED = ErrorCode("ATT-2005", 409, "Ledger chain advanced since begin; retry with a fresh ceremony")
 CEREMONY_SIGN_COUNT = ErrorCode("ATT-2006", 409, "Authenticator signCount did not increase (possible cloned key)")
 CEREMONY_CREDENTIAL_MISSING = ErrorCode("ATT-2007", 500, "Internal inconsistency: pending challenge references a missing credential")
+CEREMONY_INVALID_ACTION_BODY = ErrorCode("ATT-2008", 400, "action_body must contain only string values (the signed payload is strings-only)")
 CEREMONY_CONFLICT = ErrorCode("ATT-2000", 409, "Ceremony could not be completed; begin a fresh ceremony and retry")
 
 # ── Ledger / bundle export (3xxx) ────────────────────────────────────────────
@@ -75,6 +76,7 @@ ALL_ERROR_CODES: tuple[ErrorCode, ...] = (
     CEREMONY_CHAIN_ADVANCED,
     CEREMONY_SIGN_COUNT,
     CEREMONY_CREDENTIAL_MISSING,
+    CEREMONY_INVALID_ACTION_BODY,
     CEREMONY_CONFLICT,
     LEDGER_ENTRY_NOT_FOUND,
     LEDGER_CREDENTIAL_NOT_FOUND,

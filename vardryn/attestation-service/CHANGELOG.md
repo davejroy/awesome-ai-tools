@@ -30,6 +30,11 @@ and a full documentation set.
   (±(2⁵³−1)), matching `canonical/jcs.ts` and RFC 8785.
 - **SCR-004 (LOW):** the "signer credential not found" internal inconsistency
   now returns 500 (`ATT-2007`), not 409.
+- **SCR-005 (MEDIUM, authenticated SSRF):** `tsa_url` was accepted from the
+  client and POSTed server-side. It is now server config only
+  (`ATTESTATION_TSA_URL`, https-only) and the TSA response read is bounded.
+- **Strings-only invariant:** non-string `action_body` values are rejected at
+  the API boundary with 400 `ATT-2008` (previously an opaque 500).
 
 ### Added
 - **Structured error codes** (`service/errors.py`, `docs/ERROR_CODES.md`): all

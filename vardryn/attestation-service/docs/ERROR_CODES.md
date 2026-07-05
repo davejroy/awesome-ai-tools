@@ -34,6 +34,7 @@ The HTTP status is derived from the code (shown below). Numbering:
 | `ATT-2005` | 409 | Ledger chain advanced since begin; retry with a fresh ceremony |
 | `ATT-2006` | 409 | Authenticator signCount did not increase (possible cloned key) |
 | `ATT-2007` | 500 | Internal inconsistency: pending challenge references a missing credential |
+| `ATT-2008` | 400 | action_body contains a non-string value (the signed payload is strings-only) |
 | `ATT-3001` | 404 | Ledger entry not found |
 | `ATT-3002` | 404 | Signing credential for ledger entry not found |
 | `ATT-4001` | 503 | Cloud KMS countersigning backend is not available |
