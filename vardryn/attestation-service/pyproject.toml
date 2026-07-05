@@ -1,0 +1,36 @@
+[project]
+name = "vardryn-attestation-service"
+version = "0.2.0"
+description = "Forensically-verifiable WebAuthn/FIDO2 attestation ledger for GRC actions"
+requires-python = ">=3.11"
+readme = "README.md"
+
+# Runtime dependencies are pinned in requirements.txt (service) and
+# verifier/requirements.txt (the standalone, minimal-dependency verifier).
+# This file exists for tooling metadata, a declared Python version, and lint
+# configuration — not as the installable manifest. See docs/INSTALL_RUN_TEST.md.
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+# The verifier uses a deliberately flat import layout (sys.path.insert) so it can
+# run standalone; E402 (import-not-at-top) is expected in tests/verifier entrypoints.
+extend-exclude = ["**/__pycache__"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = [
+    "E501",  # line length handled by formatter/line-length above
+    "E402",  # module-level import not at top: intentional after sys.path.insert
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests intentionally keep noqa'd late imports after the sys.path shim.
+"tests/*" = ["E402"]
+"verifier/*" = ["E402"]
+"canonical/*" = ["E402"]
+
+# There is no pytest harness: each tests/test_*.py is a standalone script with an
+# `if __name__ == "__main__":` block (many require DATABASE_URL and the
+# attestation_app role). CI (.github/workflows/attestation-service-ci.yml) runs
+# them individually against an ephemeral Postgres.

@@ -1,0 +1,96 @@
+name: attestation-service CI
+
+# Runs the full attestation-service test suite (including the 16-case tamper
+# matrix, the JCS cross-implementation vectors, and the vendoring byte-identity
+# guard) against an ephemeral Postgres. This is the safety net the codebase
+# already has as tests but nothing previously enforced automatically.
+
+on:
+  push:
+    paths:
+      - "vardryn/attestation-service/**"
+      - ".github/workflows/attestation-service-ci.yml"
+  pull_request:
+    paths:
+      - "vardryn/attestation-service/**"
+      - ".github/workflows/attestation-service-ci.yml"
+
+defaults:
+  run:
+    working-directory: vardryn/attestation-service
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgresql+psycopg2://attestation_app:test@127.0.0.1/attestation_test
+      PGHOST: 127.0.0.1
+      PGUSER: postgres
+      PGPASSWORD: postgres
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install service + test dependencies
+        run: pip install -r requirements.txt
+
+      - name: Provision database (create DB, apply migrations, set app role password)
+        run: |
+          psql -h 127.0.0.1 -U postgres -c "CREATE DATABASE attestation_test;"
+          psql -h 127.0.0.1 -U postgres -d attestation_test -f db/migrations/001_attestation_schema.sql
+          psql -h 127.0.0.1 -U postgres -d attestation_test -f db/migrations/002_pending_challenges.sql
+          psql -h 127.0.0.1 -U postgres -c "ALTER ROLE attestation_app WITH LOGIN PASSWORD 'test';"
+
+      - name: Lint (ruff, non-blocking informational)
+        run: |
+          pip install ruff
+          ruff check . || true
+
+      - name: Canonicalization vectors + cross-impl (JCS)
+        run: python3 canonical/test_jcs.py
+
+      - name: Error-code + mapping unit tests (no DB)
+        run: python3 tests/test_error_mapping.py
+
+      - name: Verifier CLI robustness (no DB)
+        run: python3 tests/test_verifier_cli.py
+
+      - name: WebAuthn registration / assertion (no DB)
+        run: |
+          python3 tests/test_webauthn_registration.py
+          python3 tests/test_webauthn_assertion.py
+
+      - name: Platform countersignature + RFC 3161 (no DB)
+        run: |
+          python3 tests/test_platform_signature.py
+          python3 tests/test_tsa.py
+
+      - name: Database + RLS
+        run: python3 tests/test_db_rls.py
+
+      - name: Signing ceremony (end-to-end)
+        run: python3 tests/test_webauthn_ceremony.py
+
+      - name: HTTP surface (FastAPI TestClient)
+        run: python3 tests/test_router.py
+
+      - name: Tamper matrix (16 cases) + vendoring byte-identity guard
+        run: python3 tests/test_tamper_matrix.py

@@ -129,9 +129,10 @@ is available on `PATH`.
 | 1 | Ledger schema + RLS (`db/migrations/001`), `canonical/jcs.py`, `service/payload.py`, `entry_hash.py` | Done |
 | 2 | WebAuthn registration (`webauthn_registration.py`), AAGUID allowlist | Done; MDS3 cross-check still a stub (see below) |
 | 3 | Signing ceremony (`webauthn_ceremony.py`, `db/migrations/002`), KMS countersigning, RFC 3161 timestamping, WORM snapshot archival | Done; KMS/TSA/GCS not exercised against live infra (see below) |
-| 4 | `vardryn.attestation.bundle/1.0` assembly (`bundle.py`) + standalone `verifier/verify_attestation.py` (11 checks) | Done |
-| 5 | 14-case adversarial tamper matrix (`tests/test_tamper_matrix.py`), vendoring byte-identity check | Done — all 11 checks exercised, all 14 cases produce their expected FAIL(s) |
+| 4 | `vardryn.attestation.bundle/1.0` assembly (`bundle.py`) + standalone `verifier/verify_attestation.py` (12 checks) | Done |
+| 5 | Adversarial tamper matrix (`tests/test_tamper_matrix.py`, 16 cases: 14 field mutations + T25/T26), vendoring byte-identity check | Done — all 12 checks exercised, every case produces its expected FAIL(s) |
 | 6 | FastAPI HTTP surface (`service/router.py`, `tests/test_router.py`), auditor-facing docs, this README | Done |
+| post-6 | SCR-001 fix (V09/V09b out-of-band platform-key pinning + V12b entry↔payload binding, checks now 12; T25/T26); SCR-002/003/004; structured error codes (`service/errors.py`); verifier crash/size hardening | Done — see `IMPLEMENTATION-LOG.md`, `SECURITY-REVIEW-FINDINGS.md` |
 
 ## Known limitations (read before relying on this in production)
 

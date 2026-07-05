@@ -23,9 +23,16 @@ hardware-signed payload. **Empirically proven** exploit: with `tsa_token=None`
 (`--platform-key`), V12b entry↔payload binding (check 12), tamper cases T25/T26.
 See `IMPLEMENTATION-LOG.md`. Freeze-blocking exit criteria met.
 
-## Proposed for Cowork triage (not yet filed as SCRs — I cannot edit the OS SCR log)
+## Follow-on findings — ALL FIXED (2026-07-05)
 
-### Proposed SCR-002 (MEDIUM) — registration/ceremony origin & rpId trusted from the request body
+> Status update: SCR-002/003/004 below were subsequently **fixed** in code (see
+> `CHANGELOG.md` / `IMPLEMENTATION-LOG.md`), and a further adversarial hardening
+> round (see `REVIEW-LOG.md`) fixed additional HIGH/MEDIUM items (confirmation-view
+> completeness, verifier never-crash + resource limits, request-body limit,
+> `/health`, structured logging, CI). The descriptions are retained below as the
+> record of what was found.
+
+### SCR-002 (MEDIUM) — registration/ceremony origin & rpId trusted from the request body — FIXED
 `service/router.py` `complete_registration` and `complete` (ceremony) verify the
 WebAuthn `origin` / `rp_id` against values taken from the **same request**
 (`req.origin`, `req.rp_id`), not from server-authoritative config. The server
@@ -40,7 +47,7 @@ challenge (`consume`). It also lets the *original* bundle's `rp` diverge from th
   request-body `origin`/`rp_id` as advisory or drop them.
 - **Invariant impact:** none violated; strengthens the WebAuthn origin binding.
 
-### Proposed SCR-003 (LOW, latent) — JCS integer path unbounded (RFC 8785 conformance)
+### SCR-003 (LOW, latent) — JCS integer path unbounded (RFC 8785 conformance) — FIXED
 `canonical/jcs.py` serializes any `int` via `str(value)` with no safe-integer
 bound, while the float path restricts to `|f| ≤ 2^53-1`. RFC 8785 §3.2.2.3
 mandates ECMAScript `Number` semantics; `canonical/jcs.ts:36`
@@ -55,7 +62,7 @@ is strings-only (invariant I-strings), and `seq` is a small counter — but
   `2^53-1` and never exercise float rejection).
 - **Invariant impact:** none; strengthens JCS determinism / cross-impl agreement.
 
-### Proposed SCR-004 (LOW, cosmetic) — verifier error-mapping for internal-consistency failure
+### SCR-004 (LOW, cosmetic) — verifier error-mapping for internal-consistency failure — FIXED
 `service/router.py` `_http_exception_for_ceremony_error` maps the
 "signer credential … not found" `CeremonyError` (a should-not-happen internal
 inconsistency: a pending challenge references a missing credential) to `409
