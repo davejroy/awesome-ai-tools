@@ -1,0 +1,34 @@
+# Attestation Service — service/ + tests/ dependencies.
+#
+# For the standalone verifier's (much smaller) dependency set, see
+# verifier/requirements.txt — it is designed to be installable with zero
+# dependency on this file or on the rest of this service.
+
+fastapi==0.136.3
+uvicorn[standard]==0.49.0
+pydantic==2.13.4
+
+# Database (service/db.py, service/models.py; db/migrations/001+002)
+sqlalchemy==2.0.50
+psycopg2-binary==2.9.12
+
+# WebAuthn / CBOR / COSE (service/webauthn_*.py, service/entry_hash.py)
+cbor2==6.1.2
+cryptography==41.0.7
+fido2==2.2.0
+
+# RFC 3161 timestamping (service/tsa.py)
+asn1crypto==1.5.1
+requests==2.33.1
+
+# Live Cloud KMS / GCS backends for service/router.py's
+# get_countersigner() / get_snapshot_archiver() (ENGINEERING-CONFIDENCE
+# NOTE 1 in service/router.py). NOT installed in this dev environment and
+# NOT exercised against a live GCP project anywhere in this repo — every
+# test substitutes an in-memory fake via app.dependency_overrides. Required
+# for an actual deployment.
+google-cloud-kms==3.0.0
+google-cloud-storage==2.18.2
+
+# Test-only (FastAPI TestClient — tests/test_router.py)
+httpx==0.28.1

@@ -1,0 +1,6 @@
+project_id      = "vardryn-grc-prod"
+region          = "us-central1"
+zone            = "us-central1-a"
+environment     = "dev"
+backend_image   = "gcr.io/vardryn-grc-prod/vardryn-backend:latest"
+db_password_secret = "projects/vardryn-grc-prod/secrets/db-password/versions/latest"

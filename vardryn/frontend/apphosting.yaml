@@ -1,0 +1,37 @@
+# Firebase App Hosting configuration
+# Docs: https://firebase.google.com/docs/app-hosting/configure
+
+runConfig:
+  # Scale to zero between requests (matches Cloud Run backend strategy)
+  minInstances: 0
+  maxInstances: 10
+  concurrency: 80
+  cpu: 1
+  memoryMiB: 512
+
+env:
+  # Public vars are safe to commit; secret values go in Firebase Secret Manager
+  - variable: NEXT_PUBLIC_FIREBASE_PROJECT_ID
+    value: vardryn-grc-prod
+    availability:
+      - BUILD
+      - RUNTIME
+
+  - variable: NEXT_PUBLIC_RP_ID
+    value: vardryn.com
+    availability:
+      - BUILD
+      - RUNTIME
+
+  - variable: NEXT_PUBLIC_RP_NAME
+    value: Vardryn GRC
+    availability:
+      - BUILD
+      - RUNTIME
+
+  # Injected at deploy time from Firebase Secret Manager — never hardcoded
+  - variable: NEXT_PUBLIC_API_URL
+    secret: vardryn-api-url
+    availability:
+      - BUILD
+      - RUNTIME

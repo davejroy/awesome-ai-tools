@@ -1,0 +1,34 @@
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.5",
+  "version": 1,
+  "metadata": {
+    "component": {
+      "type": "application",
+      "name": "vardryn-attestation-service",
+      "version": "0.2.0",
+      "description": "Forensically-verifiable WebAuthn/FIDO2 attestation ledger for GRC actions"
+    },
+    "properties": [
+      {"name": "note", "value": "Direct dependencies only. Licenses as declared by package metadata; confirm for formal compliance. Regenerate transitive closure with cyclonedx-py for a release SBOM."},
+      {"name": "runtime.python", "value": ">=3.11"},
+      {"name": "runtime.postgresql", "value": "16"}
+    ]
+  },
+  "components": [
+    {"type": "library", "name": "fastapi", "version": "0.136.3", "licenses": [{"license": {"id": "MIT"}}], "purl": "pkg:pypi/fastapi@0.136.3", "scope": "required"},
+    {"type": "library", "name": "starlette", "version": "1.3.1", "licenses": [{"license": {"id": "BSD-3-Clause"}}], "purl": "pkg:pypi/starlette@1.3.1", "scope": "required"},
+    {"type": "library", "name": "uvicorn", "version": "0.49.0", "licenses": [{"license": {"id": "BSD-3-Clause"}}], "purl": "pkg:pypi/uvicorn@0.49.0", "scope": "required"},
+    {"type": "library", "name": "pydantic", "version": "2.13.4", "licenses": [{"license": {"id": "MIT"}}], "purl": "pkg:pypi/pydantic@2.13.4", "scope": "required"},
+    {"type": "library", "name": "sqlalchemy", "version": "2.0.50", "licenses": [{"license": {"id": "MIT"}}], "purl": "pkg:pypi/sqlalchemy@2.0.50", "scope": "required"},
+    {"type": "library", "name": "psycopg2-binary", "version": "2.9.12", "licenses": [{"license": {"name": "LGPL-3.0-or-later with exceptions"}}], "purl": "pkg:pypi/psycopg2-binary@2.9.12", "scope": "required"},
+    {"type": "library", "name": "cbor2", "version": "6.1.2", "licenses": [{"license": {"id": "MIT"}}], "purl": "pkg:pypi/cbor2@6.1.2", "scope": "required"},
+    {"type": "library", "name": "cryptography", "version": "41.0.7", "licenses": [{"expression": "Apache-2.0 OR BSD-3-Clause"}], "purl": "pkg:pypi/cryptography@41.0.7", "scope": "required"},
+    {"type": "library", "name": "fido2", "version": "2.2.0", "licenses": [{"license": {"id": "BSD-2-Clause"}}], "purl": "pkg:pypi/fido2@2.2.0", "scope": "required"},
+    {"type": "library", "name": "asn1crypto", "version": "1.5.1", "licenses": [{"license": {"id": "MIT"}}], "purl": "pkg:pypi/asn1crypto@1.5.1", "scope": "required"},
+    {"type": "library", "name": "requests", "version": "2.33.1", "licenses": [{"license": {"id": "Apache-2.0"}}], "purl": "pkg:pypi/requests@2.33.1", "scope": "required"},
+    {"type": "library", "name": "httpx", "version": "0.28.1", "licenses": [{"license": {"id": "BSD-3-Clause"}}], "purl": "pkg:pypi/httpx@0.28.1", "scope": "optional"},
+    {"type": "library", "name": "google-cloud-kms", "version": "3.0.0", "licenses": [{"license": {"id": "Apache-2.0"}}], "purl": "pkg:pypi/google-cloud-kms@3.0.0", "scope": "optional", "properties": [{"name": "note", "value": "declared for production; not installed or exercised in-repo"}]},
+    {"type": "library", "name": "google-cloud-storage", "version": "2.18.2", "licenses": [{"license": {"id": "Apache-2.0"}}], "purl": "pkg:pypi/google-cloud-storage@2.18.2", "scope": "optional", "properties": [{"name": "note", "value": "declared for production; not installed or exercised in-repo"}]}
+  ]
+}

@@ -1,0 +1,16 @@
+# Minimal dependencies for verifier/verify_attestation.py — the standalone,
+# offline attestation bundle verifier (§5.2). Everything else it imports
+# (canonical/jcs.py, webauthn_primitives.py, entry_hash.py,
+# platform_signature.py, authenticator_allowlist.py, tsa_verify.py) is
+# vendored into this directory; only these third-party packages are needed.
+
+cryptography==41.0.7
+cbor2==6.1.2
+fido2==2.2.0
+
+# Optional. Without asn1crypto, verifier/tsa_verify.py cannot be imported
+# and verify_attestation.py degrades check 10 (RFC 3161 timestamp) to SKIP
+# instead of PASS/FAIL — every other check still runs normally. See
+# verifier/tsa_verify.py and verifier/verify_attestation.py module
+# docstrings.
+asn1crypto==1.5.1
