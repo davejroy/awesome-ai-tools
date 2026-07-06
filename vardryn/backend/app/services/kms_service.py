@@ -31,25 +31,36 @@ def _get_client() -> kms_v1.KeyManagementServiceClient:
 
 
 def sha512_digest(data: bytes) -> bytes:
+    """SHA-512 content hash of the evidence file — stored in the ledger record."""
     return hashlib.sha512(data).digest()
+
+
+def signing_digest(data: bytes) -> bytes:
+    """The digest actually SIGNED by KMS. It MUST match the signing key's
+    algorithm: the evidence key is EC_SIGN_P384_SHA384 (see
+    terraform/modules/cloud-kms), so this is SHA-384. (The SHA-512 content hash
+    is stored separately in the ledger; both commit to the same file bytes.)"""
+    return hashlib.sha384(data).digest()
 
 
 def sign_digest(digest: bytes) -> Tuple[str, str]:
     """
-    Signs a SHA-512 digest using the evidence signing key.
+    Signs a SHA-384 digest (matching the EC_SIGN_P384_SHA384 key) with the
+    configured, rotatable key version.
 
     Returns:
         (base64_signature, key_version_resource_name)
     """
     client = _get_client()
     key_name = settings.kms_signing_key_id
+    version = settings.kms_signing_key_version
 
-    # KMS requires the digest wrapped in the appropriate proto message
-    digest_proto = kms_v1.Digest(sha512=digest)
+    # Digest algorithm MUST match the key algorithm (P-384 -> SHA-384).
+    digest_proto = kms_v1.Digest(sha384=digest)
 
     response = client.asymmetric_sign(
         request={
-            "name": f"{key_name}/cryptoKeyVersions/1",
+            "name": f"{key_name}/cryptoKeyVersions/{version}",
             "digest": digest_proto,
         }
     )
@@ -60,8 +71,9 @@ def sign_digest(digest: bytes) -> Tuple[str, str]:
 
 def verify_signature(digest: bytes, signature_b64: str, key_version: str) -> bool:
     """
-    Verifies a previously recorded signature. Used by auditors and automated
-    integrity checks; never called on the critical upload path.
+    Verifies a previously recorded signature over the SHA-384 signing digest.
+    Used by auditors and automated integrity checks; never on the upload path.
+    `digest` must be the SHA-384 signing digest (signing_digest()).
     """
     from cryptography.hazmat.primitives.asymmetric import ec, utils
     from cryptography.hazmat.primitives import hashes, serialization

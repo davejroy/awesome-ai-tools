@@ -17,7 +17,10 @@ const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "";
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
 function base64UrlDecode(value: string): ArrayBuffer {
-  const padded  = value.replace(/-/g, "+").replace(/_/g, "/");
+  const base64  = value.replace(/-/g, "+").replace(/_/g, "/");
+  // Restore '=' padding — WebAuthn challenges/credential IDs are base64url
+  // WITHOUT padding, and atob() requires a length that is a multiple of four.
+  const padded  = base64 + "=".repeat((4 - (base64.length % 4)) % 4);
   const binary  = atob(padded);
   const bytes   = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);

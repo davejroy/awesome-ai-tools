@@ -11,6 +11,10 @@ class Settings(BaseSettings):
 
     kms_keyring_id: str
     kms_signing_key_id: str
+    # Asymmetric KMS keys sign a specific version (there is no "primary" for
+    # asymmetric sign). Set this to the current enabled version after a manual
+    # rotation so signing does not keep using a disabled/destroyed version.
+    kms_signing_key_version: str = "1"
 
     evidence_bucket: str
 
