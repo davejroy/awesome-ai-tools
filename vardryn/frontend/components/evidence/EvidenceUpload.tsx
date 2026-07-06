@@ -97,6 +97,13 @@ export function EvidenceUpload({ controlId }: Props) {
           onDragLeave={() => setState("idle")}
           onDrop={onDrop}
           onClick={() => inputRef.current?.click()}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" || e.key === " ") {
+              e.preventDefault();
+              inputRef.current?.click();
+            }
+          }}
+          tabIndex={0}
           role="button"
           aria-label="Upload evidence file"
         >
